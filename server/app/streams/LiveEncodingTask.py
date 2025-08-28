@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, cast, Any
 
 import aiofiles
 import aiohttp
@@ -433,6 +433,177 @@ class LiveEncodingTask:
         return result
 
 
+    def buildFFmpegToHWEncCOptions(self,
+        quality: QUALITY_TYPES,
+        encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'],
+        channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
+        is_fullhd_channel: bool,
+    ) -> tuple[list[str], list[str]]:
+        """
+        FFmpeg を前段に置き、入力/低遅延・音声処理のみを FFmpeg が担当し、
+        映像の圧縮は HWEncC 側のみで行うための 2 段パイプラインのオプションを組み立てる。
+
+        返り値は (ffmpeg_options, hwenc_options) のタプル。
+
+        - FFmpeg: TS 入力の解析時間・低遅延フラグ・ストリームマッピング、音声の AAC 変換とゲインのみ実施。
+                  映像は -vcodec copy で透過。出力は TS を pipe:1 に吐く。
+        - HWEncC: 入力は FFmpeg の出力 (stdin)。音声は --audio-copy でコピー、映像のみエンコード・スケール・デインタレ・GOP 設定を適用。
+
+        Args:
+            quality (QUALITY_TYPES): 映像の品質
+            encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc']): エンコーダー種別
+            channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルの種類
+            is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
+
+        Returns:
+            tuple[list[str], list[str]]: (FFmpeg に渡すオプション, HWEncC に渡すオプション)
+        """
+
+        # ---------- FFmpeg (前段) ----------
+        ffmpeg_opts: list[str] = []
+
+        # 入力解析時間 (ffmpeg の analyzeduration)
+        analyzeduration = round(500000 + (self._retry_count * 200000))
+        if channel_type == 'SKY':
+            analyzeduration += 200000
+        ffmpeg_opts.append(f'-f mpegts -analyzeduration {analyzeduration} -i pipe:0')
+
+        # ストリームマッピング: 映像/主音声/副音声/データ
+        ffmpeg_opts.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
+
+        # 低遅延系フラグ + 重複/欠落 PTS 対策
+        max_interleave_delta = round(500 + (self._retry_count * 100))
+        ffmpeg_opts.append(
+            f'-fflags nobuffer+genpts+igndts -flags low_delay -max_delay 250000 '
+            f'-max_interleave_delta {max_interleave_delta}K -threads auto -muxpreload 0 -muxdelay 0'
+        )
+
+        # 映像は前段では再エンコードせず、そのまま透過
+        ffmpeg_opts.append('-vcodec copy')
+
+        # 音声は AAC に統一しステレオ化 + 音量 2.0 の調整のみ実施
+        ffmpeg_opts.append(f'-acodec aac -aac_coder twoloop -ac 2 -ab {QUALITY[quality].audio_bitrate} -ar 48000 -af volume=2.0')
+
+        # 出力 (TS) をパイプに
+        ffmpeg_opts.append('-y -f mpegts')
+        ffmpeg_opts.append('pipe:1')
+
+        ffmpeg_result: list[str] = []
+        for o in ffmpeg_opts:
+            ffmpeg_result += o.split(' ')
+
+        # ---------- HWEncC (後段: 映像のみエンコード) ----------
+        hwenc_opts: list[str] = []
+
+        # 入力解析時間 (HWEncC の --input-*)
+        input_probesize = round(1000 + (self._retry_count * 500))
+        input_analyze = round(0.7 + (self._retry_count * 0.2), 1)
+        if channel_type == 'SKY':
+            input_probesize += 500
+            input_analyze += 0.2
+        hwenc_opts.append(f'--input-format mpegts --input-probesize {input_probesize}K --input-analyze {input_analyze}')
+        if channel_type != 'BS4K':
+            hwenc_opts.append('--fps 30000/1001')
+        hwenc_opts.append('--input -')
+        if encoder_type == 'VCEEncC':
+            hwenc_opts.append('--avsw')
+        else:
+            hwenc_opts.append('--avhw')
+
+        # ストリームマッピング: 音声は FFmpeg 側で整えたものをコピー、データは timed_id3 を通す
+        hwenc_opts.append('--audio-copy --data-copy timed_id3')
+
+        # 低遅延や起動高速化のためのフラグ + 重複/欠落 PTS 対策
+        max_interleave_delta_hw = round(500 + (self._retry_count * 100))
+        hwenc_opts.append('-m avioflags:direct -m fflags:nobuffer+flush_packets+igndts+genpts -m flush_packets:1 -m max_delay:250000')
+        hwenc_opts.append(f'-m max_interleave_delta:{max_interleave_delta_hw}K -m muxpreload:0 -m muxdelay:0 --output-thread 0 --lowlatency')
+        # ログレベルはデフォルト warning、デバッグ時のみ debug
+        try:
+            debug_encoder = Config().general.debug_encoder  # type: ignore[attr-defined]
+        except Exception:
+            debug_encoder = False
+        hwenc_opts.append('--log-level debug' if debug_encoder else '--log-level warning')
+        if encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc':
+            hwenc_opts.append('--disable-opencl')
+        if encoder_type == 'NVEncC':
+            hwenc_opts.append('--disable-nvml 1 --disable-dx11 --disable-vulkan')
+
+        # 映像のコーデック/ビットレート
+        if QUALITY[quality].is_hevc is True:
+            hwenc_opts.append('--codec hevc')
+        else:
+            hwenc_opts.append('--codec h264')
+        if QUALITY[quality].is_hevc is True and encoder_type == 'QSVEncC':
+            hwenc_opts.append(f'--qvbr {QUALITY[quality].video_bitrate} --fallback-rc')
+        else:
+            hwenc_opts.append(f'--vbr {QUALITY[quality].video_bitrate}')
+        hwenc_opts.append(f'--max-bitrate {QUALITY[quality].video_bitrate_max}')
+
+        # H.265/HEVC の調整
+        if QUALITY[quality].is_hevc is True:
+            if encoder_type == 'QSVEncC':
+                hwenc_opts.append('--qvbr-quality 30')
+            elif encoder_type == 'NVEncC':
+                hwenc_opts.append('--qp-min 23:26:30 --lookahead 16 --multipass 2pass-full --weightp --bref-mode middle --aq --aq-temporal')
+
+        # GOP/プロファイル/品質など
+        if encoder_type != 'VCEEncC':
+            hwenc_opts.append('--repeat-headers')
+        if encoder_type == 'QSVEncC':
+            hwenc_opts.append('--quality balanced')
+        elif encoder_type == 'NVEncC':
+            hwenc_opts.append('--preset default')
+        elif encoder_type == 'VCEEncC':
+            hwenc_opts.append('--preset balanced')
+        elif encoder_type == 'rkmppenc':
+            hwenc_opts.append('--preset best')
+        hwenc_opts.append('--dar 16:9')
+        if QUALITY[quality].is_hevc is True:
+            hwenc_opts.append('--profile main')
+        else:
+            hwenc_opts.append('--profile high')
+
+        gop_length_second = self.GOP_LENGTH_SECONDS_H264
+        if QUALITY[quality].is_hevc is True:
+            gop_length_second = self.GOP_LENGTH_SECONDS_H265
+        if channel_type == 'BS4K':
+            hwenc_opts.append(f'--avsync vfr --gop-len {int(gop_length_second * 60)}')
+        else:
+            hwenc_opts.append('--interlace tff')
+            if QUALITY[quality].is_60fps is True:
+                if encoder_type == 'QSVEncC':
+                    hwenc_opts.append('--vpp-deinterlace bob')
+                elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
+                    hwenc_opts.append('--vpp-yadif mode=bob')
+                elif encoder_type == 'rkmppenc':
+                    hwenc_opts.append('--vpp-deinterlace bob_i5')
+                hwenc_opts.append(f'--avsync vfr --gop-len {int(gop_length_second * 60)}')
+            else:
+                if encoder_type == 'QSVEncC':
+                    hwenc_opts.append('--vpp-deinterlace normal')
+                elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
+                    hwenc_opts.append('--vpp-afs preset=default')
+                elif encoder_type == 'rkmppenc':
+                    hwenc_opts.append('--vpp-deinterlace normal_i5')
+                hwenc_opts.append(f'--avsync vfr --gop-len {int(gop_length_second * 30)}')
+
+        # 出力解像度 (フル HD 例外対応含む)
+        video_width = QUALITY[quality].width
+        video_height = QUALITY[quality].height
+        if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
+            video_width = 1920
+        hwenc_opts.append(f'--output-res {video_width}x{video_height}')
+
+        # 出力先
+        hwenc_opts.append('--output-format mpegts')
+        hwenc_opts.append('--output -')
+
+        hwenc_result: list[str] = []
+        for o in hwenc_opts:
+            hwenc_result += o.split(' ')
+
+        return ffmpeg_result, hwenc_result
+
     async def acquireMirakurunTuner(self, channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']) -> bool:
         """
         Mirakurun / mirakc で空きチューナーを確保できるまで待機する
@@ -632,21 +803,30 @@ class LiveEncodingTask:
 
         # HWEncC
         else:
-
-            # オプションを取得
-            encoder_options = self.buildHWEncCOptions(self.live_stream.quality, ENCODER_TYPE, channel.type, is_fullhd_channel)
+            # オプションを取得（前段 FFmpeg + 後段 HWEncC）
+            ffmpeg_preproc_options, encoder_options = self.buildFFmpegToHWEncCOptions(
+                self.live_stream.quality, ENCODER_TYPE, channel.type, is_fullhd_channel
+            )
+            logging.info(f'[Live: {self.live_stream.live_stream_id}] FFmpeg (Preproc) Commands:\nffmpeg {" ".join(ffmpeg_preproc_options)}')
             logging.info(f'[Live: {self.live_stream.live_stream_id}] {ENCODER_TYPE} Commands:\n{ENCODER_TYPE} {" ".join(encoder_options)}')
 
-            # エンコーダープロセスを非同期で作成・実行
-            encoder = await asyncio.subprocess.create_subprocess_exec(
-                *[LIBRARY_PATH[ENCODER_TYPE], *encoder_options],
-                stdin = tsreadex_read_pipe,  # tsreadex からの入力
-                stdout = asyncio.subprocess.PIPE,  # ストリーム出力
-                stderr = asyncio.subprocess.PIPE,  # ログ出力
+            # シェルパイプを使う（PowerShell 環境では自動で cmd に渡るためここでは汎用シェルを利用）
+            ffmpeg_cmd = f'"{LIBRARY_PATH["FFmpeg"]}" ' + " ".join(ffmpeg_preproc_options)
+            hwenc_cmd = f'"{LIBRARY_PATH[ENCODER_TYPE]}" ' + " ".join(encoder_options)
+            pipeline_cmd = f'{ffmpeg_cmd} | {hwenc_cmd}'
+            logging.info(f'[Live: {self.live_stream.live_stream_id}] Pipeline Command:\n{pipeline_cmd}')
+            encoder = await asyncio.subprocess.create_subprocess_shell(
+                pipeline_cmd,
+                stdin = tsreadex_read_pipe,
+                stdout = asyncio.subprocess.PIPE,
+                stderr = asyncio.subprocess.PIPE,
             )
 
         # tsreadex の読み込み用パイプを閉じる
-        os.close(tsreadex_read_pipe)
+        try:
+            os.close(tsreadex_read_pipe)
+        except OSError:
+            pass
 
         # ***** チューナーの起動と接続 *****
 
@@ -676,6 +856,7 @@ class LiveEncodingTask:
             self.live_stream.setStatus('Standby', 'チューナーを起動しています…')
             session = aiohttp.ClientSession()
             try:
+                assert session is not None
                 response = await session.get(
                     url = GetMirakurunAPIEndpointURL(f'/api/services/{mirakurun_service_id}/stream'),
                     headers = {**API_REQUEST_HEADERS, 'X-Mirakurun-Priority': '0'},
@@ -698,10 +879,12 @@ class LiveEncodingTask:
                     self.live_stream.psi_data_archiver = None
 
                 # エンコードタスクを停止する
+                assert session is not None
                 await session.close()
                 return
 
             # 放送波の MPEG2-TS の受信元の StreamReader として設定
+            assert response is not None
             stream_reader = response.content
 
         # EDCB バックエンド
@@ -786,7 +969,7 @@ class LiveEncodingTask:
             # 受信した放送波が入るイテレータを作成
             # R/W バッファ: 188B (TS Packet Size) * 256 = 48128B
             async def GetIterator(
-                    stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader,
+                    stream_reader: Any,
                     chunk_size: int = ts.PACKET_SIZE * 256,
                 ) -> AsyncIterator[bytes]:
                 while True:
@@ -830,7 +1013,7 @@ class LiveEncodingTask:
                         break
 
                     # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                    if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                    if (is_running is False or tsreadex.returncode is not None or encoder.returncode is not None):
                         break
 
             except OSError:
@@ -910,7 +1093,7 @@ class LiveEncodingTask:
                     break
 
                 # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                if (is_running is False or tsreadex.returncode is not None or encoder.returncode is not None):
                     break
 
         # 前回のチャンク書き込みから 0.025 秒以上経ったもののチャンクが 64KB に達していない際に Writer に代わってチャンク書き込みを行うタスク
@@ -942,7 +1125,7 @@ class LiveEncodingTask:
                         chunk_written_at = time.monotonic()
 
                 # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                if (is_running is False or tsreadex.returncode is not None or encoder.returncode is not None):
                     break
 
         # タスクを非同期で実行
@@ -1129,7 +1312,7 @@ class LiveEncodingTask:
                                 logging.warning(log)
 
                 # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                if (is_running is False or tsreadex.returncode is not None or encoder.returncode is not None):
                     break
 
             # タスクを終える前にエンコーダーのログファイルを閉じる
