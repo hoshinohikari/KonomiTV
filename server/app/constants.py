@@ -248,7 +248,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '810p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 1440,
         height = 810,
         video_bitrate = '5500K',
@@ -257,7 +257,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '810p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 1440,
         height = 810,
         video_bitrate = '2500K',
@@ -266,7 +266,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '720p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 1280,
         height = 720,
         video_bitrate = '4500K',
@@ -275,7 +275,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '720p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 1280,
         height = 720,
         video_bitrate = '2000K',
@@ -284,7 +284,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '540p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 960,
         height = 540,
         video_bitrate = '3000K',
@@ -293,7 +293,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '540p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 960,
         height = 540,
         video_bitrate = '1400K',
@@ -302,7 +302,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '480p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 854,
         height = 480,
         video_bitrate = '2000K',
@@ -311,7 +311,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '480p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 854,
         height = 480,
         video_bitrate = '1050K',
@@ -320,7 +320,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '360p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 640,
         height = 360,
         video_bitrate = '1100K',
@@ -329,7 +329,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '360p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 640,
         height = 360,
         video_bitrate = '750K',
@@ -338,7 +338,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '240p': Quality(
         is_hevc = False,
-        is_60fps = False,
+        is_60fps = True,
         width = 426,
         height = 240,
         video_bitrate = '550K',
@@ -347,7 +347,7 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
     ),
     '240p-hevc': Quality(
         is_hevc = True,
-        is_60fps = False,
+        is_60fps = True,
         width = 426,
         height = 240,
         video_bitrate = '450K',
