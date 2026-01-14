@@ -906,14 +906,17 @@ class RecordedScanTask:
             logging.info(f'{file_path}: Starting background analysis task...')
             # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
             async with ProcessLimiter.getSemaphore('RecordedScanTask'):
-                # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
+                # まずはキーフレーム解析を順次実行して優先度を確保（I/O/CPU負荷が高く、他処理の準備に必要）
+                logging.debug(f'{file_path}: Acquiring drive semaphore for keyframe analysis')
+                async with DriveIOLimiter.getSemaphore(file_path):
+                    logging.info(f'{file_path}: Starting keyframe analysis (sequential)')
+                    await KeyFrameAnalyzer(file_path, recorded_program.recorded_video.container_format).analyzeAndSave()
+
+                # キーフレーム解析完了後に CM 検出とサムネイル生成を並列実行
+                logging.debug(f'{file_path}: Acquiring drive semaphore for CM detection and thumbnail generation')
                 async with DriveIOLimiter.getSemaphore(file_path):
                     await asyncio.gather(
-                        # 録画ファイルのキーフレーム情報を解析し DB に保存
-                        KeyFrameAnalyzer(file_path, recorded_program.recorded_video.container_format).analyzeAndSave(),
-                        # 録画ファイルの CM 区間を検出し DB に保存
                         CMSectionsDetector(file_path, recorded_program.recorded_video.duration).detectAndSave(),
-                        # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成
                         ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave(),
                     )
             logging.info(f'{file_path}: Background analysis task completed.')
