@@ -13,7 +13,7 @@ import subprocess
 import threading
 import winreg
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TextIO, cast
 
 import httpx
 import psutil
@@ -29,6 +29,8 @@ import win32serviceutil
 
 # KonomiTV サーバーのベースディレクトリ
 BASE_DIR = Path(__file__).parent
+# サービスのログを出力するファイルパス
+LOG_FILE_PATH = BASE_DIR.parent / 'logs' / 'KonomiTV-Service.log'
 
 
 class KonomiTVServiceFramework(win32serviceutil.ServiceFramework):
@@ -52,6 +54,7 @@ class KonomiTVServiceFramework(win32serviceutil.ServiceFramework):
         self.is_running = False
         self.server_process: subprocess.Popen[bytes] | None = None
         self.ctrl_c_handler_installed = False  # CTRL+C を無視するハンドラが登録されているか
+        self.log_file_path: Path = LOG_FILE_PATH  # サービスのログを書き出すファイルパス
 
 
     @staticmethod
@@ -108,6 +111,13 @@ class KonomiTVServiceFramework(win32serviceutil.ServiceFramework):
 
         # Windows サービスのステータスを起動待機中に設定
         self.ReportServiceStatus(win32service.SERVICE_START_PENDING)
+
+        # サービスのログファイル出力先ディレクトリを確実に作成する
+        ## Windows サービスとして起動するとカレントディレクトリの概念が変わるため、絶対パスで指定したログディレクトリを事前に作成しておく
+        try:
+            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as ex:
+            servicemanager.LogWarningMsg(f'[KonomiTV-Service][SvcDoRun] Failed to create log directory: {ex!r}')
 
         # ログオン中ユーザーのすべてのネットワークドライブのマウントを試みる
         ## Windows サービスは異なるセッションで実行されるため、既定では（ユーザー権限で動作していても）ネットワークドライブはマウントされていない
@@ -167,10 +177,34 @@ class KonomiTVServiceFramework(win32serviceutil.ServiceFramework):
             while self.is_running is True:
 
                 # 仮想環境上の Python から KonomiTV のサーバープロセス (Uvicorn) を起動
-                self.server_process = subprocess.Popen(
-                    [self._exe_name_, '-X', 'utf8', str(BASE_DIR / 'KonomiTV.py')],
-                    cwd = BASE_DIR,  # カレントディレクトリを指定
-                )
+                ## サービス環境では標準出力/標準エラーが破棄されるため、ログファイルにリダイレクトしてデバッグしやすくする
+                log_file: TextIO | None
+                try:
+                    # UTF-8 で追記し続ける。サービスの稼働中は開きっぱなしにして、プロセス終了後に確実にクローズする
+                    log_file = self.log_file_path.open('a', encoding='utf-8')
+                except Exception as ex:
+                    servicemanager.LogWarningMsg(
+                        f'[KonomiTV-Service][SvcDoRun] Failed to open log file; fallback to DEVNULL: {ex!r}',
+                    )
+                    log_file = None
+
+                try:
+                    self.server_process = subprocess.Popen(
+                        [self._exe_name_, '-X', 'utf8', str(BASE_DIR / 'KonomiTV.py')],
+                        cwd = BASE_DIR,  # カレントディレクトリを指定
+                        stdout = log_file if log_file is not None else subprocess.DEVNULL,
+                        stderr = log_file if log_file is not None else subprocess.DEVNULL,
+                    )
+                except Exception as ex:
+                    servicemanager.LogErrorMsg(
+                        f'[KonomiTV-Service][SvcDoRun] Failed to launch server process: {ex!r}',
+                    )
+                    if log_file is not None:
+                        try:
+                            log_file.close()
+                        except Exception:
+                            pass
+                    break
 
                 # プロセスが終了するまで待つ
                 ## Windows サービスではメインループが終了してしまうとサービスも終了扱いになってしまう
@@ -181,6 +215,13 @@ class KonomiTVServiceFramework(win32serviceutil.ServiceFramework):
                     except KeyboardInterrupt:
                         continue  # 子プロセスの再起動/停止で CTRL_C_EVENT が飛んできたケースに備える
                 self.server_process = None
+
+                # プロセス終了後にログファイルを確実にクローズする
+                if log_file is not None:
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
 
                 # プロセス終了後、もしこの時点で再起動が必要であることを示すロックファイルが存在する場合、KonomiTV サーバーを再起動する
                 if RESTART_REQUIRED_LOCK_PATH.exists():
