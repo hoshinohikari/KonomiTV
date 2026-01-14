@@ -482,7 +482,7 @@ class LiveEncodingTask:
         analyzeduration = round(2000000 + (self._retry_count * 200000))
         if channel_type == 'SKY':
             analyzeduration += 200000
-        ffmpeg_opts.append(f'-f mpegts -analyzeduration {analyzeduration} -probesize 5000000 -fflags nobuffer+genpts+igndts+discardcorrupt -err_detect ignore_err -i pipe:0')
+        ffmpeg_opts.append(f'-re -f mpegts -analyzeduration {analyzeduration} -probesize 5000000 -fflags nobuffer+genpts+igndts+discardcorrupt -err_detect ignore_err -i pipe:0')
 
         # ストリームマッピング: 映像/主音声/副音声/データ
         ffmpeg_opts.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -c:d copy -ignore_unknown')
