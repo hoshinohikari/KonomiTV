@@ -68,7 +68,15 @@ LIBRARY_PATH = {
 }
 
 # データベース (Tortoise ORM) の設定
-__model_list = [name for _, name, _ in pkgutil.iter_modules(path=['app/models'])]
+# CWD に依存すると Windows サービス実行時などに app/models を正しく解決できず、
+# モデルが登録されないまま Tortoise ORM を初期化してしまうことがある。
+# 絶対パスを使って確実に server/app/models を参照する。
+__model_list = [
+    name
+    for _, name, _ in pkgutil.iter_modules(
+        path=[str(BASE_DIR / 'app' / 'models')],
+    )
+]
 DATABASE_CONFIG = {
     'timezone': 'Asia/Tokyo',
     'connections': {
