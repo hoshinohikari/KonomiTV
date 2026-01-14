@@ -4,7 +4,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 from zoneinfo import ZoneInfo
 
 import typer
@@ -147,7 +147,7 @@ class FFprobeResult(BaseModel):
                 try:
                     video_streams.append(stream)
                 except Exception as ex:
-                    logging.warning(f'Invalid video stream data: {ex}')
+                    logging.warning('Invalid video stream data:', exc_info=ex)
         return video_streams
 
     def getAudioStreams(self) -> list[FFprobeAudioStream]:
@@ -159,7 +159,7 @@ class FFprobeResult(BaseModel):
                 try:
                     audio_streams.append(stream)
                 except Exception as ex:
-                    logging.warning(f'Invalid audio stream data: {ex}')
+                    logging.warning('Invalid audio stream data:', exc_info=ex)
         return audio_streams
 
 class FFprobeSampleResult(BaseModel):
@@ -175,7 +175,7 @@ class FFprobeSampleResult(BaseModel):
                 try:
                     video_streams.append(stream)
                 except Exception as ex:
-                    logging.warning(f'Invalid video stream data: {ex}')
+                    logging.warning('Invalid video stream data:', exc_info=ex)
         return video_streams
 
     def getAudioStreams(self) -> list[FFprobeAudioStream]:
@@ -187,7 +187,7 @@ class FFprobeSampleResult(BaseModel):
                 try:
                     audio_streams.append(stream)
                 except Exception as ex:
-                    logging.warning(f'Invalid audio stream data: {ex}')
+                    logging.warning('Invalid audio stream data:', exc_info=ex)
         return audio_streams
 
 
@@ -196,6 +196,10 @@ class MetadataAnalyzer:
     録画ファイルのメタデータを解析するクラス
     app.metadata モジュール内の各クラスを統括し、録画ファイルから取り出せるだけのメタデータを取り出す
     """
+
+    # FFprobe が VPS/SPS/PPS を確実に読み込めるよう解析対象の尺とサイズを拡張する
+    FFPROBE_ANALYZE_DURATION_US: ClassVar[str] = str(30 * 1_000_000)
+    FFPROBE_PROBESIZE: ClassVar[str] = '80M'
 
     def __init__(self, recorded_file_path: Path) -> None:
         """
@@ -270,11 +274,11 @@ class MetadataAnalyzer:
 
         # FFprobe から録画ファイルのメディア情報を取得
         ## 取得に失敗した場合は KonomiTV で再生可能なファイルではないと判断し、None を返す
-        result = self.analyzeMediaInfo()
+        result = self.__analyzeMediaInfo()
         if result is None:
             return None
         full_probe, sample_probe, end_ts_offset = result
-        logging.debug_simple(f'{self.recorded_file_path}: FFprobe analysis completed.')
+        logging.debug(f'{self.recorded_file_path}: FFprobe analysis completed.')
 
         # MPEG-TS の TS パケットサイズが 188 以外であれば弾く（BDAV 等は非対応）
         if full_probe.format.format_name == 'mpegts':
@@ -289,7 +293,7 @@ class MetadataAnalyzer:
                     logging.warning(f'{self.recorded_file_path}: Unsupported TS packet size detected: {first_bad} bytes.')
                     return None
             except Exception as ex:
-                logging.warning(f'{self.recorded_file_path}: Failed to validate ts_packetsize.', exc_info=ex)
+                logging.warning(f'{self.recorded_file_path}: Failed to validate ts_packetsize:', exc_info=ex)
 
         # メディア情報から録画ファイルのメタデータを取得
         # 全般（コンテナ情報）
@@ -298,19 +302,30 @@ class MetadataAnalyzer:
             container_format = 'MPEG-TS'
         elif 'mp4' in full_probe.format.format_name:
             container_format = 'MPEG-4'
-        ## 再生時間
-        if full_probe.format.duration is not None:
-            duration = float(full_probe.format.duration)
 
         ## 部分解析: 映像・音声情報を取得
         is_video_track_analyzed = False
         is_primary_audio_track_analyzed = False
         is_secondary_audio_track_analyzed = False
         full_probe_video_streams = full_probe.getVideoStreams()
+        full_probe_audio_streams = full_probe.getAudioStreams()
         sample_probe_video_streams = sample_probe.getVideoStreams()
         sample_probe_audio_streams = sample_probe.getAudioStreams()
-        # FFprobe の結果として "video" / "audio" の codec_type そのものは存在するが、
-        # 詳細が取得できず FFprobeOtherStream にフォールバックしているケース（スクランブルや不正 TS）を検出する
+        if len(full_probe_video_streams) == 0:
+            logging.warning(f'{self.recorded_file_path}: No valid video streams found. (from full probe)')
+            return None
+        if len(full_probe_audio_streams) == 0:
+            logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from full probe)')
+            return None
+        if len(sample_probe_video_streams) == 0:
+            logging.warning(f'{self.recorded_file_path}: No valid video streams found. (from sample probe)')
+            return None
+        if len(sample_probe_audio_streams) == 0:
+            logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from sample probe)')
+            return None
+
+        ## FFprobe の結果として "video" / "audio" の codec_type そのものは存在するが、
+        ## 詳細が取得できず FFprobeOtherStream にフォールバックしているケース（スクランブルや不正 TS）を検出する
         has_video_codec_type = any(s.codec_type == 'video' for s in sample_probe.streams)
         has_audio_codec_type = any(s.codec_type == 'audio' for s in sample_probe.streams)
         if len(sample_probe_video_streams) == 0 and has_video_codec_type is True:
@@ -321,6 +336,25 @@ class MetadataAnalyzer:
             return None
         if len(sample_probe_video_streams) == 0 and len(sample_probe_audio_streams) == 0:
             logging.warning(f'{self.recorded_file_path}: No valid video or audio streams found.')
+            return None
+
+        ## 再生時間
+        if full_probe.format.duration is not None:
+            ## コンテナ自体の再生時間が取得できている場合（通常のケース）
+            if (full_probe_video_streams[0].duration is not None and
+                full_probe_video_streams[0].duration < float(full_probe.format.duration)):
+                ## コンテナ自体の再生時間は特に tsreplace した TS データなどでは映像や音声よりも長くなる場合があるため、
+                ## 映像ストリームの再生時間が取得できていて、かつコンテナ自体の再生時間より短い場合はそれを優先的に使う
+                duration = full_probe_video_streams[0].duration
+            else:
+                ## 万が一映像ストリームの再生時間が取得できていない場合、コンテナ自体の再生時間を使う
+                duration = float(full_probe.format.duration)
+        elif full_probe_video_streams[0].duration is not None:
+            ## 万が一コンテナ自体の再生時間が取得できていない場合、映像ストリームの再生時間が取得できていればそれを使う
+            duration = full_probe_video_streams[0].duration
+        else:
+            ## どちらの再生時間も取得できていない場合は録画ファイルが破損していると判断し、None を返す
+            logging.warning(f'{self.recorded_file_path}: Duration is missing or invalid. ignored.')
             return None
 
         ## 映像情報
@@ -446,7 +480,7 @@ class MetadataAnalyzer:
 
         # ファイルハッシュを計算
         try:
-            file_hash = self.calculateFileHash()
+            file_hash = self.__calculateFileHash(end_ts_offset)
         except ValueError:
             logging.warning(f'{self.recorded_file_path}: File size is too small. ignored.')
             return None
@@ -489,7 +523,7 @@ class MetadataAnalyzer:
             analyzer = TSInfoAnalyzer(recorded_video, end_ts_offset=end_ts_offset)
             recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
             if recorded_program is not None:
-                logging.debug_simple(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis completed.')
+                logging.debug(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis completed.')
                 # 取得成功時は録画開始時刻と録画終了時刻も解析する
                 recording_time = analyzer.analyzeRecordingTime()
                 if recording_time is not None:
@@ -505,7 +539,7 @@ class MetadataAnalyzer:
             analyzer = TSInfoAnalyzer(recorded_video)
             recorded_program = analyzer.analyze()  # 取得失敗時は None が返る
             if recorded_program is not None:
-                logging.debug_simple(f'{self.recorded_file_path}: {container_format} Service/Event analysis completed.')
+                logging.debug(f'{self.recorded_file_path}: {container_format} Service/Event analysis completed.')
                 # 取得成功時は録画開始時刻と録画終了時刻も解析する
                 recording_time = analyzer.analyzeRecordingTime()
                 if recording_time is not None:
@@ -564,27 +598,35 @@ class MetadataAnalyzer:
         return recorded_program
 
 
-    def calculateFileHash(self, chunk_size: int = 1024 * 1024, num_chunks: int = 3) -> str:
+    def __calculateFileHash(self, end_ts_offset: int | None, chunk_size: int = 1024 * 1024, num_chunks: int = 3) -> str:
         """
         録画ファイルのハッシュを計算する
-        録画ファイル全体をハッシュ化すると時間がかかるため、ファイルの先頭、中央、末尾の3箇所のみをハッシュ化する
+        録画ファイル全体をハッシュ化すると時間がかかるため、ファイルの複数箇所のみをハッシュ化する
+        MPEG-TS 形式で `end_ts_offset` が指定されている場合は、末尾のゼロ埋め領域を含まない有効 TS データ領域のみを対象とする
 
         Args:
-            chunk_size (int, optional): チャンクのサイズ. Defaults to 1024 * 1024.
-            num_chunks (int, optional): チャンクの数. Defaults to 3.
+            end_ts_offset (int | None): 有効な TS データの終了位置 (バイト単位) (None の場合はファイルサイズ全体を対象とする)
+            chunk_size (int, optional): チャンクのサイズ (デフォルト: 1MB)
+            num_chunks (int, optional): チャンクの数 (デフォルト: 3)
 
         Raises:
-            ValueError: ファイルサイズが小さい場合に発生する
+            ValueError: 有効データ領域が小さく十分な数のチャンクが取得できない場合
 
         Returns:
             str: 録画ファイルのハッシュ
         """
 
-        # ファイルのサイズを取得する
+        # 実際のファイルサイズを取得する
         file_size = self.recorded_file_path.stat().st_size
 
-        # ファイルサイズが`chunk_size * num_chunks`より小さい場合は十分な数のチャンクが取得できないため例外を発生させる
-        if file_size < chunk_size * num_chunks:
+        # end_ts_offset が有効な場合は、有効 TS データ領域のサイズとして優先的に利用する
+        if end_ts_offset is not None and end_ts_offset > 0:
+            effective_size = min(end_ts_offset, file_size)
+        else:
+            effective_size = file_size
+
+        # 有効データ領域が `chunk_size * num_chunks` より小さい場合は十分な数のチャンクが取得できないため例外を発生させる
+        if effective_size < chunk_size * num_chunks:
             raise ValueError(f'File size must be at least {chunk_size * num_chunks} bytes.')
 
         with self.recorded_file_path.open('rb') as file:
@@ -597,18 +639,26 @@ class MetadataAnalyzer:
             for chunk_index in range(num_chunks):
 
                 # 現在のチャンクのバイトオフセットを計算する
-                offset = (file_size // (num_chunks + 1)) * (chunk_index + 1)
+                ## (num_chunks + 1) で分割した位置 (1/4, 2/4, 3/4 など) からチャンクを取得する
+                offset = (effective_size // (num_chunks + 1)) * (chunk_index + 1)
                 file.seek(offset)
 
                 # チャンクを読み込み、ハッシュオブジェクトを更新する
-                chunk = file.read(chunk_size)
+                ## end_ts_offset が指定されている場合でも有効データ領域を超えないように読み込みサイズを制限する
+                remaining = effective_size - offset
+                if remaining <= 0:
+                    break
+                read_size = min(chunk_size, remaining)
+                chunk = file.read(read_size)
+                if not chunk:
+                    break
                 hash_obj.update(chunk)
 
         # ハッシュの16進数表現を返す
         return hash_obj.hexdigest()
 
 
-    def calculateTSFileDuration(self, search_block_size: int = 1024 * 1024) -> tuple[float, int] | None:
+    def __calculateTSFileDuration(self, search_block_size: int = 1024 * 1024) -> tuple[float, int] | None:
         """
         TS ファイル内の最初と最後の有効な PCR タイムスタンプから再生時間（秒）を算出する (written with o3-mini)
         MediaInfo から再生時間を取得できなかった場合のフォールバックとして利用する
@@ -731,7 +781,7 @@ class MetadataAnalyzer:
                 # --- 再生時間の算出 ---
                 # 先頭と末尾の PCR 値から再生時間（秒）を算出する
                 duration = last_timestamp - first_timestamp
-                logging.debug_simple(f'{self.recorded_file_path}: Duration calculated: {duration} seconds.')
+                logging.debug(f'{self.recorded_file_path}: Duration calculated: {duration} seconds.')
 
                 return (duration, valid_data_end)
 
@@ -740,7 +790,7 @@ class MetadataAnalyzer:
             return None
 
 
-    def analyzeMediaInfo(self) -> tuple[FFprobeResult, FFprobeSampleResult, int | None] | None:
+    def __analyzeMediaInfo(self) -> tuple[FFprobeResult, FFprobeSampleResult, int | None] | None:
         """
         録画ファイルのメディア情報を FFprobe を使って解析する
         全体解析と部分解析の2段階で解析を行う
@@ -755,32 +805,34 @@ class MetadataAnalyzer:
         args_full = [
             '-hide_banner',
             '-loglevel', 'error',
+            '-analyzeduration', self.FFPROBE_ANALYZE_DURATION_US,
+            '-probesize', self.FFPROBE_PROBESIZE,
             '-show_format',
             '-show_streams',
             '-show_programs',
             '-of', 'json',
             str(self.recorded_file_path),
         ]
-        full_json = self._runFFprobe(args_full)
+        full_json = self.__runFFprobe(args_full)
         if full_json is None:
             return None
 
         try:
             full_probe = FFprobeResult(**full_json)
         except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to parse full ffprobe result.', exc_info=ex)
+            logging.warning(f'{self.recorded_file_path}: Failed to parse full ffprobe result:', exc_info=ex)
             return None
 
         # FFprobe から再生時間を取得できない場合のフォールバック処理
         duration_result: tuple[float, int] | None = None
         if full_probe.format.duration is None and full_probe.format.format_name == 'mpegts':
             # MPEG-TS 形式の場合のみ、フォールバックとして自前で長さを算出する
-            duration_result = self.calculateTSFileDuration()
+            duration_result = self.__calculateTSFileDuration()
             if duration_result is not None:
                 duration, _ = duration_result
                 # FFprobe の結果を更新
                 full_probe.format.duration = str(duration)
-                logging.debug_simple(f'{self.recorded_file_path}: Duration fallback completed: {duration} seconds.')
+                logging.debug(f'{self.recorded_file_path}: Duration fallback completed: {duration} seconds.')
             else:
                 # 再生時間を算出できなかった (ファイルが破損しているなど)
                 logging.warning(f'{self.recorded_file_path}: Duration is missing and fallback failed.')
@@ -804,7 +856,7 @@ class MetadataAnalyzer:
                     # サンプルデータが全てゼロ埋めされているかチェック
                     if sample_data and all(byte == 0 for byte in sample_data):
                         # ゼロ埋め領域の境界を取得するため calculateTSFileDuration を実行
-                        duration_result = self.calculateTSFileDuration()
+                        duration_result = self.__calculateTSFileDuration()
                         if duration_result is None:
                             logging.warning(f'{self.recorded_file_path}: Failed to calculate duration.')
                             return None
@@ -817,24 +869,23 @@ class MetadataAnalyzer:
                         sample_size = min(sample_size, end_ts_offset - offset)  # 有効データ範囲を超えないようにする
                         sample_data = f.read(sample_size)
 
-                    # サンプルを stdin で渡して解析
-                    ## 重要: バッファサイズを TS パケットサイズの100倍程度に抑えないと、ファイルによっては不正確な結果が返ってくることがある
-                    ## なぜバッファサイズ次第で解析結果が変わるのか不可解だが、一回の送信サイズを小さく保った方が不正確な結果を避けられそう…？
-                    ## 素直にファイルに書き出してから参照させるのが最も確実だが、比較的容量の大きいファイルをこのためだけに書き込むのは気が引ける
+                    # 録画ファイルから切り出したサンプルを標準入力から FFprobe に渡して解析
                     args_sample = [
                         '-hide_banner',
                         '-loglevel', 'error',
+                        '-analyzeduration', self.FFPROBE_ANALYZE_DURATION_US,
+                        '-probesize', self.FFPROBE_PROBESIZE,
                         '-f', 'mpegts',
                         '-i', 'pipe:0',
                         '-show_streams',
                         '-of', 'json',
                     ]
-                    sample_json = self._runFFprobe(args_sample, input_bytes=sample_data)
+                    sample_json = self.__runFFprobe(args_sample, input_bytes=sample_data)
             else:
                 # MPEG-TS 形式でない場合は部分解析はせず、全体解析の結果をそのまま設定
                 sample_json = full_json
         except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to analyze sample via ffprobe.', exc_info=ex)
+            logging.warning(f'{self.recorded_file_path}: Failed to analyze sample via ffprobe:', exc_info=ex)
             return None
 
         if sample_json is None:
@@ -843,12 +894,12 @@ class MetadataAnalyzer:
         try:
             sample_probe = FFprobeSampleResult(**sample_json)
         except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to parse sample ffprobe result.', exc_info=ex)
+            logging.warning(f'{self.recorded_file_path}: Failed to parse sample ffprobe result:', exc_info=ex)
             return None
 
         # 解析処理中に calculateTSFileDuration() を実行した場合は、有効な TS データの終了位置も一緒に返す
         ## calculateTSFileDuration() が実行されている時点で、当該録画ファイルの後半部分にゼロ埋めデータが存在することを示す
-        ## この値は TSInfoAnalyzer で番組情報を解析する際に利用される
+        ## この値は TSInfoAnalyzer で番組情報を解析する際に参照される
         if duration_result is not None:
             _, end_ts_offset = duration_result
             return (full_probe, sample_probe, end_ts_offset)
@@ -856,7 +907,7 @@ class MetadataAnalyzer:
             return (full_probe, sample_probe, None)
 
 
-    def _runFFprobe(self, args: list[str], input_bytes: bytes | None = None) -> dict[str, Any] | None:
+    def __runFFprobe(self, args: list[str], input_bytes: bytes | None = None) -> dict[str, Any] | None:
         """
         FFprobe を実行する
 
@@ -867,6 +918,7 @@ class MetadataAnalyzer:
         Returns:
             dict[str, Any] | None: FFprobe の結果
         """
+
         try:
             cmd = [LIBRARY_PATH['FFprobe'], *args]
             if input_bytes is None:
@@ -878,7 +930,7 @@ class MetadataAnalyzer:
                 return None
             return cast(dict[str, Any], json.loads(proc.stdout.decode('utf-8')))
         except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to run ffprobe.', exc_info=ex)
+            logging.warning(f'{self.recorded_file_path}: Failed to run ffprobe:', exc_info=ex)
             return None
 
 

@@ -1,9 +1,10 @@
 <template>
     <router-link v-ripple class="recorded-program"
-        :to="program.recorded_video.status === 'Recording' || !program.recorded_video.has_key_frames ? { path: '' } : `/videos/watch/${program.id}`"
+        :to="program.recorded_video.status === 'Recorded' && program.recorded_video.has_key_frames ? `/videos/watch/${program.id}` : { path: '' }"
         :class="{
             'recorded-program--recording': program.recorded_video.status === 'Recording',
-            'recorded-program--analyzing': !program.recorded_video.has_key_frames,
+            'recorded-program--analyzing': !program.recorded_video.has_key_frames && program.recorded_video.status !== 'AnalysisFailed',
+            'recorded-program--failed': program.recorded_video.status === 'AnalysisFailed',
         }">
         <div class="recorded-program__container">
             <div class="recorded-program__thumbnail">
@@ -13,6 +14,10 @@
                 <div v-if="program.recorded_video.status === 'Recording'" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--recording">
                     <div class="recorded-program__thumbnail-status-dot"></div>
                     録画中
+                </div>
+                <div v-else-if="program.recorded_video.status === 'AnalysisFailed'" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--failed">
+                    <Icon icon="fluent:error-circle-12-regular" width="15px" height="15px" />
+                    メタデータ解析失敗
                 </div>
                 <div v-else-if="!program.recorded_video.has_key_frames" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--analyzing">
                     <Icon icon="fluent:clock-12-regular" width="15px" height="15px" />
@@ -98,23 +103,17 @@
                             </template>
                             <v-list-item-title class="ml-3">録画ファイルをダウンロード ({{ Utils.formatBytes(program.recorded_video.file_size) }})</v-list-item-title>
                         </v-list-item>
-                        <v-list-item @click="reanalyzeVideo" v-ftooltip="'再生時に必要な録画ファイル情報や番組情報などを解析し直します'">
+                        <v-list-item @click="reanalyzeVideo" v-ftooltip="'再生時に必要な録画ファイル情報・番組情報・サムネイルなどをすべて再解析・再生成します（数分かかります）'">
                             <template v-slot:prepend>
                                 <Icon icon="fluent:book-arrow-clockwise-20-regular" width="20px" height="20px" />
                             </template>
                             <v-list-item-title class="ml-3">メタデータを再解析</v-list-item-title>
                         </v-list-item>
-                        <v-list-item @click="regenerateThumbnail(true)" v-ftooltip="'既存のシークバー用サムネイルから代表サムネイルを選び直します 変更反映にはブラウザキャッシュの削除が必要です'">
+                        <v-list-item @click="regenerateThumbnail()" v-ftooltip="'サムネイルのみを再生成します（数分かかります） 変更を反映するにはブラウザキャッシュの削除が必要です'">
                             <template v-slot:prepend>
                                 <Icon icon="fluent:image-arrow-counterclockwise-24-regular" width="20px" height="20px" />
                             </template>
-                            <v-list-item-title class="ml-3">サムネイルを更新</v-list-item-title>
-                        </v-list-item>
-                        <v-list-item @click="regenerateThumbnail(false)" v-ftooltip="'サムネイルを完全に作り直します（数分かかります） 変更反映にはブラウザキャッシュの削除が必要です'">
-                            <template v-slot:prepend>
-                                <Icon icon="fluent:image-arrow-counterclockwise-24-regular" width="20px" height="20px" />
-                            </template>
-                            <v-list-item-title class="ml-3">サムネイルを再作成</v-list-item-title>
+                            <v-list-item-title class="ml-3">サムネイルを再生成</v-list-item-title>
                         </v-list-item>
                         <v-divider></v-divider>
                         <v-list-item @click="showDeleteConfirmation" :disabled="program.recorded_video.status === 'Recording'" class="recorded-program__menu-list-item--danger">
@@ -200,12 +199,12 @@ const reanalyzeVideo = async () => {
     }
 };
 
-// サムネイル再作成
-const regenerateThumbnail = async (skip_tile_if_exists: boolean = false) => {
-    Message.success('サムネイルの再作成を開始しました。完了までしばらくお待ちください。');
-    const result = await Videos.regenerateThumbnail(props.program.id, skip_tile_if_exists);
+// サムネイル再生成
+const regenerateThumbnail = async () => {
+    Message.success('サムネイルの再生成を開始しました。完了までしばらくお待ちください。');
+    const result = await Videos.regenerateThumbnail(props.program.id);
     if (result === true) {
-        Message.success('サムネイルの再作成が完了しました。');
+        Message.success('サムネイルの再生成が完了しました。');
     }
 };
 
@@ -380,6 +379,13 @@ const deleteVideo = async () => {
                 svg {
                     color: rgb(var(--v-theme-primary));
                     animation: progress-rotate 1.5s infinite;
+                }
+            }
+
+            &--failed {
+                gap: 3px;
+                svg {
+                    color: rgb(var(--v-theme-error));
                 }
             }
 
@@ -752,7 +758,7 @@ const deleteVideo = async () => {
         }
     }
 
-    &--recording, &--analyzing {
+    &--recording, &--analyzing, &--failed {
         pointer-events: none;
         &:hover {
             background: rgb(var(--v-theme-background-lighten-1));

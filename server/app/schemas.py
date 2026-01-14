@@ -89,7 +89,7 @@ class Genre(TypedDict):
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
     id: int = -1  # メタデータ取得時は ID が定まらないため -1 を設定
-    status: Literal['Recording', 'Recorded']
+    status: Literal['Recording', 'Recorded', 'AnalysisFailed']
     file_path: str
     file_hash: str
     file_size: int
@@ -258,10 +258,6 @@ class UserUpdateRequestForAdmin(BaseModel):
 
 class TwitterCookieAuthRequest(BaseModel):
     cookies_txt: str
-
-class TwitterPasswordAuthRequest(BaseModel):
-    screen_name: str
-    password: str
 
 # モデルに関連しない API レスポンスの構造を表す Pydantic モデル
 ## レスポンスボディの JSON 構造と一致する
@@ -539,12 +535,6 @@ class TimelineTweetsResult(TwitterAPIResult):
     next_cursor_id: str
     previous_cursor_id: str
     tweets: list[Tweet]
-
-class TwitterChallengeData(TwitterAPIResult):
-    endpoint_infos: dict[str, TwitterGraphQLAPIEndpointInfo]
-    verification_code: str
-    challenge_js_code: str
-    challenge_animation_svg_codes: list[str]
 
 class TwitterGraphQLAPIEndpointInfo(BaseModel):
     method: Literal['GET', 'POST']
