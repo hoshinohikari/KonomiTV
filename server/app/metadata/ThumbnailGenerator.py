@@ -79,6 +79,9 @@ class ThumbnailGenerator:
     LETTERBOX_CONTINUOUS_RATIO: ClassVar[float] = 0.7  # 連続性判定の閾値（この割合以上が類似していれば連続とみなす）
     LETTERBOX_EDGE_THRESHOLD: ClassVar[float] = 0.05  # エッジ密度の閾値（これ以下なら一様な領域とみなす）
 
+    # 分析対象を制限する秒数（None の場合は全体を解析）
+    ANALYZE_MAX_SEC: ClassVar[float | None] = 10 * 60  # デフォルトは最初の10分のみ解析
+
     # 画質評価の重み付け（実写向け）
     SCORE_WEIGHTS: ClassVar[dict[str, float]] = {
         'std_lum': 0.6,  # 輝度の標準偏差 (全体的な明暗の差)
@@ -164,11 +167,30 @@ class ThumbnailGenerator:
         self.file_path = file_path
         self.container_format = container_format
         self.duration_sec = duration_sec
+        # 候補区間は一旦保持する（後で解析対象の長さに基づいてクリップされる）
         self.candidate_intervals = candidate_time_ranges
         self.face_detection_mode = face_detection_mode
 
-        # 動画の長さに応じて適切なタイル化間隔を計算
-        self.base_tile_interval_sec = self.__calculateBaseTileInterval(duration_sec)
+        # 動画の長さに応じて解析対象を制限 (ANALYZE_MAX_SEC が指定されている場合)
+        self.analysis_duration = min(self.duration_sec, self.ANALYZE_MAX_SEC) if self.ANALYZE_MAX_SEC is not None else self.duration_sec
+        if self.analysis_duration != self.duration_sec:
+            logging.debug(f'{self.file_path}: Limiting analysis to first {self.analysis_duration:.1f} sec (ANALYZE_MAX_SEC).')
+            # candidate_intervals を解析対象時間内にクリップ
+            clipped_intervals: list[tuple[float, float]] = []
+            for (s, e) in self.candidate_intervals:
+                # 範囲外はスキップ
+                if e <= 0 or s >= self.analysis_duration:
+                    continue
+                ns = max(0.0, s)
+                ne = min(self.analysis_duration, e)
+                if ne > ns:
+                    clipped_intervals.append((ns, ne))
+            if clipped_intervals != self.candidate_intervals:
+                logging.debug(f'{self.file_path}: Candidate intervals clipped to analysis window: {clipped_intervals}')
+            self.candidate_intervals = clipped_intervals
+
+        # 動画の長さに応じて適切なタイル化間隔を計算 (解析対象時間を使用)
+        self.base_tile_interval_sec = self.__calculateBaseTileInterval(self.analysis_duration)
 
         # タイル情報を計算して初期化
         ## コンストラクタで計算することで、以降のメソッドで None チェックが不要になる
@@ -311,7 +333,7 @@ class ThumbnailGenerator:
             ThumbnailGenerator: マイグレーション用に初期化された ThumbnailGenerator インスタンス
         """
 
-        return cls(
+        inst = cls(
             file_path = anyio.Path(file_path),
             container_format = 'MPEG-TS',  # マイグレーション処理では使用しないためダミー値
             file_hash = file_hash,
@@ -319,6 +341,10 @@ class ThumbnailGenerator:
             candidate_time_ranges = [],  # マイグレーション処理では使用しないため空リスト
             face_detection_mode = None,  # マイグレーション処理では使用しないため None
         )
+        # マイグレーションではファイル全体を対象にするため、解析上限を無効化してレイアウトを再計算
+        inst.analysis_duration = duration_sec
+        inst._recalculateAnalysisLayout()
+        return inst
 
 
     async def generateAndSave(self) -> None:
@@ -334,6 +360,8 @@ class ThumbnailGenerator:
 
         start_time = time.time()
         logging.info(f'{self.file_path}: Generating thumbnail... / Face detection mode: {self.face_detection_mode}')
+        if hasattr(self, 'analysis_duration') and self.analysis_duration != self.duration_sec:
+            logging.info(f'{self.file_path}: Analysis limited to first {self.analysis_duration:.1f} sec')
 
         # Global concurrency limit for thumbnail generation to protect I/O and CPU
         async with ProcessLimiter.getSemaphore('ThumbnailGenerator'):
@@ -432,12 +460,12 @@ class ThumbnailGenerator:
         # WebP に収められる最大タイル数
         max_tiles = max_cols * max_rows
 
-        # 基準間隔で動画全体をカバーした場合の期待タイル数を算出
-        expected_tiles = math.ceil(self.duration_sec / self.base_tile_interval_sec)
+        # 基準間隔で解析対象時間をカバーした場合の期待タイル数を算出
+        expected_tiles = math.ceil(self.analysis_duration / self.base_tile_interval_sec)
         # もし期待タイル数が WebP の制限を超える場合は、間隔を引き上げて調整
         if expected_tiles > max_tiles:
             # 最大タイル数に収まるように間隔を再計算（0.1秒単位で切り上げ）
-            adjusted_interval = math.ceil((self.duration_sec / max_tiles) * 10) / 10
+            adjusted_interval = math.ceil((self.analysis_duration / max_tiles) * 10) / 10
             # 基準間隔より短くならないように調整
             tile_interval_sec = max(self.base_tile_interval_sec, adjusted_interval)
             logging.warning(
@@ -450,7 +478,7 @@ class ThumbnailGenerator:
             tile_interval_sec = self.base_tile_interval_sec
 
         # 調整後の間隔で実際に生成されるタイル数を算出
-        total_tiles = math.ceil(self.duration_sec / tile_interval_sec)
+        total_tiles = math.ceil(self.analysis_duration / tile_interval_sec)
         if total_tiles < 1:
             total_tiles = 1
         # タイル数から必要な行数を算出
@@ -459,12 +487,14 @@ class ThumbnailGenerator:
         if tile_rows > max_rows:
             # 念のため、上限を超える場合はさらに間隔を引き上げて収める
             total_tiles = max_cols * max_rows
-            tile_interval_sec = math.ceil((self.duration_sec / total_tiles) * 10) / 10
+            tile_interval_sec = math.ceil((self.analysis_duration / total_tiles) * 10) / 10
             tile_rows = max_rows
             logging.warning(
                 f'{self.file_path}: Tile rows still exceed WebP limit. '
                 f'Adjusting interval again to {tile_interval_sec:.1f} sec.'
             )
+
+        # ここでレイアウト情報を返す前に、インスタンス側の値を更新するための小さなヘルパを提供している
 
         # タイル画像全体の幅と高さを算出
         tile_cols = max_cols
@@ -480,6 +510,20 @@ class ThumbnailGenerator:
 
         return (tile_interval_sec, tile_cols, tile_rows, total_tiles, tile_image_width, tile_image_height)
 
+    def _recalculateAnalysisLayout(self) -> None:
+        """
+        Recompute base interval and tile layout after changing analysis_duration.
+        """
+        self.base_tile_interval_sec = self.__calculateBaseTileInterval(self.analysis_duration)
+        (
+            self.tile_interval_sec,
+            self.tile_cols,
+            self.tile_rows,
+            self.total_tiles,
+            self.tile_image_width,
+            self.tile_image_height,
+        ) = self.__calculateTileLayout()
+
 
     def __calculateCandidateOffsets(self) -> list[float]:
         """
@@ -491,12 +535,17 @@ class ThumbnailGenerator:
 
         # 各候補フレーム抽出の開始位置（秒）を算出（動画末尾の場合は調整する）
         candidate_offsets: list[float] = []
+        # 候補抽出は解析対象時間内に限定する
         for i in range(self.total_tiles):
             offset = i * self.tile_interval_sec
-            # もし候補フレームの開始位置 + 0.01秒が動画長を超える場合、抽出可能な位置に調整する
-            if offset + 0.01 > self.duration_sec:
-                offset = max(0, self.duration_sec - 0.02)
+            # もし候補フレームの開始位置が解析対象時間を超える場合は終了
+            if offset + 0.01 > self.analysis_duration:
+                break
             candidate_offsets.append(offset)
+
+        if len(candidate_offsets) == 0:
+            # 最低1つは確保
+            candidate_offsets.append(0.0)
 
         return candidate_offsets
 
@@ -1903,6 +1952,11 @@ if __name__ == "__main__":
             "-f",
             help="顔検出モード (Human/Anime) / 指定しない場合はメタデータから自動取得",
         ),
+        max_analyze: float | None = typer.Option(
+            None,
+            "--max-analyze",
+            help="解析する最大秒数（デフォルト: 600 秒） / 指定しない場合は設定のデフォルトを使用",
+        ),
     ) -> None:
         """
         録画ファイルからサムネイルを生成する
@@ -1930,6 +1984,20 @@ if __name__ == "__main__":
             generator.candidate_intervals = [(candidate_start, candidate_end)]
         if face_detection_mode is not None:
             generator.face_detection_mode = face_detection_mode
+        if max_analyze is not None:
+            # インスタンス単位で解析上限を上書き（クラス変数は変更しない）
+            generator.analysis_duration = min(generator.duration_sec, float(max_analyze))
+            # 候補区間を解析ウィンドウにクリップし、レイアウトを再計算
+            clipped_intervals: list[tuple[float, float]] = []
+            for (s, e) in generator.candidate_intervals:
+                if e <= 0 or s >= generator.analysis_duration:
+                    continue
+                ns = max(0.0, s)
+                ne = min(generator.analysis_duration, e)
+                if ne > ns:
+                    clipped_intervals.append((ns, ne))
+            generator.candidate_intervals = clipped_intervals
+            generator._recalculateAnalysisLayout()
 
         # サムネイルを生成
         asyncio.run(generator.generateAndSave())
