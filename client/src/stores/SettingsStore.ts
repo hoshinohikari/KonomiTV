@@ -7,8 +7,9 @@ import Utils from '@/utils';
 
 
 // 選択可能な画質の種類
-export type LiveStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
-export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+// ライブ視聴専用: 'source' は再圧縮せず映像をそのまま配信する実験的オプション
+export type LiveStreamingQuality = 'source' | '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
+export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['source', '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 

@@ -341,11 +341,13 @@ class PlayerController {
                     } else {
                         // 画質リストを作成
                         for (const quality_name of LIVE_STREAMING_QUALITIES) {
+                            // 'source' は再エンコードなしのため HEVC プレフィックスを付与しない
+                            const api_quality = quality_name === 'source' ? 'source' : `${quality_name}${hevc_prefix}`;
+                            const display_name = quality_name === '1080p-60fps' ? '1080p (60fps)' : quality_name;
                             qualities.push({
-                                // 1080p-60fps のみ、見栄えの観点から表示上 "1080p (60fps)" と表示する
-                                name: quality_name === '1080p-60fps' ? '1080p (60fps)' : quality_name,
+                                name: display_name,
                                 type: 'mpegts',
-                                url: `${streaming_api_base_url}/${quality_name}${hevc_prefix}/mpegts`,
+                                url: `${streaming_api_base_url}/${api_quality}/mpegts`,
                             });
                         }
                     }

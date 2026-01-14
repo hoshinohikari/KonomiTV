@@ -203,6 +203,8 @@ QUALITY_TYPES = Literal[
     '360p-hevc',
     '240p',
     '240p-hevc',
+    # 追加: ソースそのまま出力 (映像は copy)。LiveEncodingTask で特別扱いするためのダミー品質。
+    'source',
 ]
 
 # 映像と音声の品質
@@ -350,6 +352,17 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
         video_bitrate = '450K',
         video_bitrate_max = '650K',
         audio_bitrate = '128K',
+    ),
+    # ダミーの品質。LiveEncodingTask 側で -vcodec copy を選ぶトリガーとしてのみ使用。
+    # 数値は未使用だが、型満足のため高めに設定しておく。
+    'source': Quality(
+        is_hevc = False,
+        is_60fps = False,
+        width = 1920,
+        height = 1080,
+        video_bitrate = '50000K',
+        video_bitrate_max = '80000K',
+        audio_bitrate = '256K',
     ),
 }
 

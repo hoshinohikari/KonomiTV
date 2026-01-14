@@ -168,6 +168,9 @@ const QUALITY_H265 = [
     {title: '240p (約0.20GB/h / 平均0.4Mbps)', value: '240p'},
 ];
 
+// ライブ視聴専用: 再エンコードなしで映像をそのまま配信 (FFmpeg copy)
+const QUALITY_SOURCE = [{ title: 'ソース (再エンコードなし)', value: 'source' }];
+
 export default defineComponent({
     name: 'Settings-Quality',
     components: {
@@ -190,8 +193,9 @@ export default defineComponent({
             network_circuits: ['Wi-Fi 回線時', 'モバイル回線時'],
 
             // テレビのデフォルトのストリーミング画質の選択肢
-            tv_streaming_quality: QUALITY_H264,
-            tv_streaming_quality_cellular: QUALITY_H264,
+            // 先頭に「ソース」を追加（ライブ専用）。動画の方は従来通り。
+            tv_streaming_quality: [...QUALITY_SOURCE, ...QUALITY_H264],
+            tv_streaming_quality_cellular: [...QUALITY_SOURCE, ...QUALITY_H264],
 
             // ビデオのデフォルトのストリーミング画質の選択肢
             video_streaming_quality: QUALITY_H264,
@@ -206,9 +210,9 @@ export default defineComponent({
             immediate: true,
             handler(value: boolean) {
                 if (value === true) {
-                    this.tv_streaming_quality = QUALITY_H265;
+                    this.tv_streaming_quality = [...QUALITY_SOURCE, ...QUALITY_H265];
                 } else {
-                    this.tv_streaming_quality = QUALITY_H264;
+                    this.tv_streaming_quality = [...QUALITY_SOURCE, ...QUALITY_H264];
                 }
             },
         },
@@ -216,9 +220,9 @@ export default defineComponent({
             immediate: true,
             handler(value: boolean) {
                 if (value === true) {
-                    this.tv_streaming_quality_cellular = QUALITY_H265;
+                    this.tv_streaming_quality_cellular = [...QUALITY_SOURCE, ...QUALITY_H265];
                 } else {
-                    this.tv_streaming_quality_cellular = QUALITY_H264;
+                    this.tv_streaming_quality_cellular = [...QUALITY_SOURCE, ...QUALITY_H264];
                 }
             },
         },
@@ -246,10 +250,10 @@ export default defineComponent({
     created() {
         // 通信節約モードならストリーミング画質の選択肢を H.265 にする
         if (this.settingsStore.settings.tv_data_saver_mode === true) {
-            this.tv_streaming_quality = QUALITY_H265;
+            this.tv_streaming_quality = [...QUALITY_SOURCE, ...QUALITY_H265];
         }
         if (this.settingsStore.settings.tv_data_saver_mode_cellular === true) {
-            this.tv_streaming_quality_cellular = QUALITY_H265;
+            this.tv_streaming_quality_cellular = [...QUALITY_SOURCE, ...QUALITY_H265];
         }
         if (this.settingsStore.settings.video_data_saver_mode === true) {
             this.video_streaming_quality = QUALITY_H265;

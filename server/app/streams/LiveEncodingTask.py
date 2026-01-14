@@ -157,47 +157,51 @@ class LiveEncodingTask:
         options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
-        ## コーデック
-        if QUALITY[quality].is_hevc is True:
-            options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
+        # 新規: 'source' 品質は映像をそのままコピーして出力（再エンコード・フィルタなし）
+        if quality == 'source':
+            options.append('-vcodec copy')
         else:
-            options.append('-vcodec libx264')  # H.264
-
-        ## ビットレートと品質
-        options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-        options.append('-preset veryfast -aspect 16:9')
-        if QUALITY[quality].is_hevc is True:
-            options.append('-profile:v main')
-        else:
-            options.append('-profile:v high')
-
-        ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
-        ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
-        video_width = QUALITY[quality].width
-        video_height = QUALITY[quality].height
-        if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
-            video_width = 1920
-
-        ## 最大 GOP 長 (秒)
-        ## 30fps なら ×30 、 60fps なら ×60 された値が --gop-len で使われる
-        gop_length_second = self.GOP_LENGTH_SECONDS_H264
-        if QUALITY[quality].is_hevc is True:
-            ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
-            gop_length_second = self.GOP_LENGTH_SECONDS_H265
-
-        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
-        if channel_type == "BS4K":
-            options.append(f'-vf scale={video_width}:{video_height}')
-            options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
-        else:
-            ## インターレース解除 (60i → 60p (フレームレート: 60fps))
-            if QUALITY[quality].is_60fps is True:
-                options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
-                options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
-            ## インターレース解除 (60i → 30p (フレームレート: 30fps))
+            ## コーデック
+            if QUALITY[quality].is_hevc is True:
+                options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
             else:
-                options.append(f'-vf yadif=mode=0:parity=-1:deint=1,scale={video_width}:{video_height}')
-                options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
+                options.append('-vcodec libx264')  # H.264
+
+            ## ビットレートと品質
+            options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
+            options.append('-preset veryfast -aspect 16:9')
+            if QUALITY[quality].is_hevc is True:
+                options.append('-profile:v main')
+            else:
+                options.append('-profile:v high')
+
+            ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
+            ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
+            video_width = QUALITY[quality].width
+            video_height = QUALITY[quality].height
+            if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
+                video_width = 1920
+
+            ## 最大 GOP 長 (秒)
+            ## 30fps なら ×30 、 60fps なら ×60 された値が --gop-len で使われる
+            gop_length_second = self.GOP_LENGTH_SECONDS_H264
+            if QUALITY[quality].is_hevc is True:
+                ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
+                gop_length_second = self.GOP_LENGTH_SECONDS_H265
+
+            ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
+            if channel_type == "BS4K":
+                options.append(f'-vf scale={video_width}:{video_height}')
+                options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
+            else:
+                ## インターレース解除 (60i → 60p (フレームレート: 60fps))
+                if QUALITY[quality].is_60fps is True:
+                    options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
+                    options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
+                ## インターレース解除 (60i → 30p (フレームレート: 30fps))
+                else:
+                    options.append(f'-vf yadif=mode=0:parity=-1:deint=1,scale={video_width}:{video_height}')
+                    options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
         ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
@@ -463,18 +467,18 @@ class LiveEncodingTask:
         ffmpeg_opts: list[str] = []
 
         # 入力解析時間 (ffmpeg の analyzeduration)
-        analyzeduration = round(500000 + (self._retry_count * 200000))
+        analyzeduration = round(2000000 + (self._retry_count * 200000))
         if channel_type == 'SKY':
             analyzeduration += 200000
-        ffmpeg_opts.append(f'-f mpegts -analyzeduration {analyzeduration} -i pipe:0')
+        ffmpeg_opts.append(f'-f mpegts -analyzeduration {analyzeduration} -probesize 5000000 -fflags nobuffer+genpts+igndts+discardcorrupt -err_detect ignore_err -i pipe:0')
 
         # ストリームマッピング: 映像/主音声/副音声/データ
-        ffmpeg_opts.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
+        ffmpeg_opts.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -c:d copy -ignore_unknown')
 
         # 低遅延系フラグ + 重複/欠落 PTS 対策
-        max_interleave_delta = round(500 + (self._retry_count * 100))
+        max_interleave_delta = round(1000 + (self._retry_count * 100))
         ffmpeg_opts.append(
-            f'-fflags nobuffer+genpts+igndts -flags low_delay -max_delay 250000 '
+            f'-flags low_delay -max_delay 500000 '
             f'-max_interleave_delta {max_interleave_delta}K -threads auto -muxpreload 0 -muxdelay 0'
         )
 
@@ -780,6 +784,10 @@ class LiveEncodingTask:
 
         ## ラジオチャンネルでは HW エンコードの意味がないため、FFmpeg に固定する
         if channel.is_radiochannel is True:
+            ENCODER_TYPE = 'FFmpeg'
+
+        # ソース直通モード: 品質 'source' が選ばれた場合は FFmpeg の -vcodec copy で出力するため、エンコーダーを強制的に FFmpeg にする
+        if self.live_stream.quality == 'source':
             ENCODER_TYPE = 'FFmpeg'
 
         # FFmpeg

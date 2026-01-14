@@ -6,6 +6,7 @@ import DPlayer from 'dplayer';
  * ライブストリーミング API で設定できる動画の画質
  */
 type LiveAPIVideoQuality = (
+    'source' |
     '1080p-60fps' |
     '1080p-60fps-hevc' |
     '1080p' |
