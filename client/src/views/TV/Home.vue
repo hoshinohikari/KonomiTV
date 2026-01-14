@@ -109,7 +109,7 @@
                 </div>
             </div>
         </main>
-        <div v-ripple class="floating-button" @click="Message.warning('番組表は現在開発中です。')">
+        <div v-ripple class="floating-button" @click="$router.push('/timetable/')">
             <div class="floating-button__content">
                 <Icon class="floating-button__icon" icon="fluent:calendar-20-regular" width="26px" />
                 <div class="floating-button__text">番組表</div>
@@ -798,12 +798,16 @@ export default defineComponent({
                             font-size: 14px;
                         }
                         @include smartphone-horizontal {
+                            display: block;
                             font-size: 14px;
-                            -webkit-line-clamp: 1;  // 1行までに制限
+                            white-space: nowrap;
+                            text-overflow: ellipsis;
                         }
                         @include smartphone-vertical {
+                            display: block;
                             font-size: 14px;
-                            -webkit-line-clamp: 1;  // 1行までに制限
+                            white-space: nowrap;
+                            text-overflow: ellipsis;
                         }
                     }
 
@@ -1009,7 +1013,8 @@ export default defineComponent({
     justify-content: center;
     align-items: center;
     position: fixed;
-    bottom: 72px;
+    // iPhone X 以降の Home Indicator の高さ分を考慮
+    bottom: calc(72px + env(safe-area-inset-bottom));
     right: 20px;
     padding: 12px 16px;
     background: rgb(var(--v-theme-background-lighten-2));
