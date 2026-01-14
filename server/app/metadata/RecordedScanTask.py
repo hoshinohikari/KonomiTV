@@ -1010,6 +1010,23 @@ class RecordedScanTask:
                             await generator.generateAndSave()
 
                 logging.info(f'{file_path}: Thumbnail migration finished. ({index}/{len(target_video_rows)})')
+
+                # サムネイル移行完了後、関連する RecordedVideo の key_frames / cm_sections もチェックし、
+                # どちらかが未解析（None）の場合は後台分析タスクを起動する
+                db_recorded_video_after_thumbnail = await RecordedVideo.get_or_none(id=video_row['id']).select_related('recorded_program', 'recorded_program__channel')
+                if db_recorded_video_after_thumbnail is not None:
+                    needs_background_analysis = (
+                        db_recorded_video_after_thumbnail.key_frames is None or
+                        db_recorded_video_after_thumbnail.cm_sections is None
+                    )
+                    if needs_background_analysis:
+                        logging.info(f'{file_path}: Missing keyframes or CM sections. Starting background analysis. ({index}/{len(target_video_rows)})')
+                        recorded_program_for_bg = schemas.RecordedProgram.model_validate(db_recorded_video_after_thumbnail.recorded_program, from_attributes=True)
+                        # 後台分析を非同期タスクとして起動（ブロッキングを避けるため await しない）
+                        task = asyncio.create_task(self.__runBackgroundAnalysis(recorded_program_for_bg))
+                        self._background_tasks[file_path] = task
+                else:
+                    logging.warning(f'{file_path}: RecordedVideo not found after thumbnail migration.')
             except Exception as ex:
                 logging.error(f'{file_path}: Failed to migrate thumbnail metadata:', exc_info=ex)
 
