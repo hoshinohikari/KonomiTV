@@ -8,7 +8,7 @@ import pathlib
 import random
 import subprocess
 import time
-from typing import ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import anyio
 import av
@@ -22,6 +22,7 @@ from app import logging, schemas
 from app.config import Config, LoadConfig
 from app.constants import DATABASE_CONFIG, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
 from app.models.RecordedVideo import RecordedVideo
+from app.utils import ShutdownProcessPoolExecutor
 from app.utils.ProcessLimiter import ProcessLimiter
 
 
@@ -46,6 +47,9 @@ class ThumbnailGenerator:
     WEBP_COMPRESSION: ClassVar[int] = 6  # WebP 圧縮レベル (0-6)
     WEBP_MAX_SIZE: ClassVar[int] = 16383  # WebP の最大サイズ制限 (px)
     FFMPEG_TIMEOUT: ClassVar[int] = 300  # FFmpeg サブプロセスのタイムアウト時間 (秒)
+    TSREADEX_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 600  # tsreadex 経由のフレーム抽出タイムアウト時間 (秒)
+    FRAME_EXTRACTION_MAX_DEMUX_PACKETS: ClassVar[int] = 20000  # 1候補位置でフレーム探索する最大パケット数
+    FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES: ClassVar[int] = 10  # 連続失敗時に残り候補を黒画像で埋める閾値
 
     # サムネイル情報のバージョン
     THUMBNAIL_INFO_VERSION: ClassVar[int] = 1
@@ -151,6 +155,8 @@ class ThumbnailGenerator:
         duration_sec: float,
         candidate_time_ranges: list[tuple[float, float]],
         face_detection_mode: Literal['Human', 'Anime'] | None = None,
+        has_video_stream_changes: bool = False,
+        service_id: int | None = None,
     ) -> None:
         """
         プレイヤーのシークバー用タイル画像と、候補区間内で最も良い1枚の代表サムネイルを生成するクラスを初期化する
@@ -162,14 +168,17 @@ class ThumbnailGenerator:
             duration_sec (float): 動画の再生時間(秒)
             candidate_time_ranges (list[tuple[float, float]]): 代表サムネ候補とする区間 [(start, end), ...]
             face_detection_mode (Literal['Human', 'Anime'] | None): 顔検出モード (デフォルト: None)
+            has_video_stream_changes (bool): TS 内で映像 PID や映像ストリーム構成が変化しているかどうか
+            service_id (int | None): 録画対象サービス ID (tsreadex のサービス選択に使用)
         """
 
         self.file_path = file_path
         self.container_format = container_format
         self.duration_sec = duration_sec
-        # 候補区間は一旦保持する（後で解析対象の長さに基づいてクリップされる）
         self.candidate_intervals = candidate_time_ranges
         self.face_detection_mode = face_detection_mode
+        self.has_video_stream_changes = has_video_stream_changes
+        self.service_id = service_id
 
         # 動画の長さに応じて解析対象を制限 (ANALYZE_MAX_SEC が指定されている場合)
         self.analysis_duration = min(self.duration_sec, self.ANALYZE_MAX_SEC) if self.ANALYZE_MAX_SEC is not None else self.duration_sec
@@ -177,14 +186,14 @@ class ThumbnailGenerator:
             logging.debug(f'{self.file_path}: Limiting analysis to first {self.analysis_duration:.1f} sec (ANALYZE_MAX_SEC).')
             # candidate_intervals を解析対象時間内にクリップ
             clipped_intervals: list[tuple[float, float]] = []
-            for (s, e) in self.candidate_intervals:
+            for (start_sec, end_sec) in self.candidate_intervals:
                 # 範囲外はスキップ
-                if e <= 0 or s >= self.analysis_duration:
+                if end_sec <= 0 or start_sec >= self.analysis_duration:
                     continue
-                ns = max(0.0, s)
-                ne = min(self.analysis_duration, e)
-                if ne > ns:
-                    clipped_intervals.append((ns, ne))
+                clipped_start = max(0.0, start_sec)
+                clipped_end = min(self.analysis_duration, end_sec)
+                if clipped_end > clipped_start:
+                    clipped_intervals.append((clipped_start, clipped_end))
             if clipped_intervals != self.candidate_intervals:
                 logging.debug(f'{self.file_path}: Candidate intervals clipped to analysis window: {clipped_intervals}')
             self.candidate_intervals = clipped_intervals
@@ -314,6 +323,8 @@ class ThumbnailGenerator:
             duration_sec = duration_sec,
             candidate_time_ranges = candidate_time_ranges,
             face_detection_mode = face_detection_mode,
+            has_video_stream_changes = recorded_program.recorded_video.has_video_stream_changes,
+            service_id = recorded_program.channel.service_id if recorded_program.channel is not None else None,
         )
 
 
@@ -340,6 +351,8 @@ class ThumbnailGenerator:
             duration_sec = duration_sec,
             candidate_time_ranges = [],  # マイグレーション処理では使用しないため空リスト
             face_detection_mode = None,  # マイグレーション処理では使用しないため None
+            has_video_stream_changes = False,  # マイグレーション処理では使用しないため False
+            service_id = None,  # マイグレーション処理では使用しないため None
         )
         # マイグレーションではファイル全体を対象にするため、解析上限を無効化してレイアウトを再計算
         inst.analysis_duration = duration_sec
@@ -363,7 +376,7 @@ class ThumbnailGenerator:
         if hasattr(self, 'analysis_duration') and self.analysis_duration != self.duration_sec:
             logging.info(f'{self.file_path}: Analysis limited to first {self.analysis_duration:.1f} sec')
 
-        # Global concurrency limit for thumbnail generation to protect I/O and CPU
+        # サムネイル生成のグローバル同時実行数を制限し、I/O と CPU への負荷を抑える
         async with ProcessLimiter.getSemaphore('ThumbnailGenerator'):
             try:
                 # 万が一出力先ディレクトリが無い場合は作成 (通常存在するはず)
@@ -376,14 +389,25 @@ class ThumbnailGenerator:
 
                 # 2. フレーム抽出 + タイル画像生成・保存 + 代表サムネイル保存をサブプロセス内で完結させる
                 ## 親プロセスへのフレーム配列転送を避け、メモリ使用量とコピーコストを抑制する
+                ## リクエスト切断時に ProcessPoolExecutor.__exit__() が同期的に子プロセス終了を待つとイベントループが止まるため、
+                ## コンテキストマネージャーは使わず、キャンセル時だけ待機なしで終了処理に入る
                 loop = asyncio.get_running_loop()
-                with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+                should_wait_executor = True
+                try:
                     success = await loop.run_in_executor(
                         executor,
                         self._generateAndSaveThumbnails,
                         candidate_offsets,
                         self.tile_rows,
                     )
+                except asyncio.CancelledError:
+                    should_wait_executor = False
+                    await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
+                    raise
+                finally:
+                    if should_wait_executor is True:
+                        await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
 
                 if not success:
                     logging.error(f'{self.file_path}: Failed to generate thumbnails in subprocess.')
@@ -494,8 +518,6 @@ class ThumbnailGenerator:
                 f'Adjusting interval again to {tile_interval_sec:.1f} sec.'
             )
 
-        # ここでレイアウト情報を返す前に、インスタンス側の値を更新するための小さなヘルパを提供している
-
         # タイル画像全体の幅と高さを算出
         tile_cols = max_cols
         tile_image_width = tile_width * tile_cols
@@ -510,10 +532,12 @@ class ThumbnailGenerator:
 
         return (tile_interval_sec, tile_cols, tile_rows, total_tiles, tile_image_width, tile_image_height)
 
+
     def _recalculateAnalysisLayout(self) -> None:
         """
-        Recompute base interval and tile layout after changing analysis_duration.
+        analysis_duration 変更後にタイル間隔とレイアウトを再計算する
         """
+
         self.base_tile_interval_sec = self.__calculateBaseTileInterval(self.analysis_duration)
         (
             self.tile_interval_sec,
@@ -533,9 +557,8 @@ class ThumbnailGenerator:
             list[float]: 各候補フレームの抽出開始位置（秒）のリスト
         """
 
-        # 各候補フレーム抽出の開始位置（秒）を算出（動画末尾の場合は調整する）
+        # 各候補フレーム抽出の開始位置（秒）を算出（解析対象時間内に限定する）
         candidate_offsets: list[float] = []
-        # 候補抽出は解析対象時間内に限定する
         for i in range(self.total_tiles):
             offset = i * self.tile_interval_sec
             # もし候補フレームの開始位置が解析対象時間を超える場合は終了
@@ -544,7 +567,6 @@ class ThumbnailGenerator:
             candidate_offsets.append(offset)
 
         if len(candidate_offsets) == 0:
-            # 最低1つは確保
             candidate_offsets.append(0.0)
 
         return candidate_offsets
@@ -576,8 +598,13 @@ class ThumbnailGenerator:
         except AssertionError:
             LoadConfig(bypass_validation=True)
 
-        # 1. PyAV でフレーム抽出を実行し、候補区間内のフレームをスコアリングして最良フレームを特定する
-        result = self.__extractAndScoreFrames(candidate_offsets)
+        # 1. フレーム抽出を実行し、候補区間内のフレームをスコアリングして最良フレームを特定する
+        ## 映像 PID や映像ストリーム構成が途中で変わる TS は PyAV のストリーム固定シークと相性が悪いため、
+        ## 該当録画だけ tsreadex で映像 PID を固定化した TS を順次デコードする
+        if self.has_video_stream_changes is True and self.container_format == 'MPEG-TS':
+            result = self.__extractAndScoreFramesWithTSReadEx(candidate_offsets)
+        else:
+            result = self.__extractAndScoreFrames(candidate_offsets)
         if result is None:
             logging.error(f'{self.file_path}: Failed to extract and score frames.')
             return False
@@ -611,93 +638,6 @@ class ThumbnailGenerator:
         logging.info(f'{self.file_path}: Tile image generation completed. ({time.time() - start_time_tile:.2f} sec)')
         return True
 
-    def _extractFramesWithFFmpeg(self, candidate_offsets: list[float]) -> list[NDArray[np.uint8]] | None:
-        """
-        Use FFmpeg to sequentially extract frames at the configured tile interval.
-        This avoids frequent random seeks and improves HDD/IO behavior by performing a single sequential decode.
-        Returns list of BGR frames (SCORING_SCALE) or None on failure.
-        """
-
-        scoring_width, scoring_height = self.SCORING_SCALE
-        frame_size = scoring_width * scoring_height * 3
-        fps = 1.0 / max(1e-6, self.tile_interval_sec)
-
-        cmd = [
-            LIBRARY_PATH['FFmpeg'],
-            '-hide_banner',
-            '-nostdin',
-            '-loglevel', 'error',
-            '-i', str(self.file_path),
-            '-vf', f'fps={fps:.8f},scale={scoring_width}:{scoring_height}',
-            '-pix_fmt', 'rgb24',
-            '-f', 'rawvideo',
-            'pipe:1',
-        ]
-
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as ex:
-            logging.warning(f'{self.file_path}: Failed to start FFmpeg for extraction:', exc_info=ex)
-            return None
-
-        if process.stdout is None:
-            logging.warning(f'{self.file_path}: FFmpeg process stdout is None.')
-            try:
-                process.kill()
-                process.communicate()
-            except Exception:
-                pass
-            return None
-
-        frames: list[NDArray[np.uint8]] = []
-        try:
-            # Read frame-by-frame from stdout
-            while len(frames) < self.total_tiles:
-                raw = process.stdout.read(frame_size)
-                if not raw:
-                    break
-                # If partial frame read, pad with black
-                if len(raw) < frame_size:
-                    raw += b'\x00' * (frame_size - len(raw))
-                frame = np.frombuffer(raw, dtype=np.uint8)
-                try:
-                    frame = frame.reshape((scoring_height, scoring_width, 3))
-                except Exception:
-                    logging.warning(f'{self.file_path}: FFmpeg produced an incomplete frame. Stopping read.')
-                    break
-                # RGB -> BGR
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                frames.append(frame_bgr)
-
-            # Wait briefly for FFmpeg to finish and capture stderr
-            try:
-                _, stderr = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                stderr = b''
-
-            if process.returncode not in (None, 0):
-                logging.warning(f'{self.file_path}: FFmpeg frame extraction failed with return code {process.returncode}: {stderr.decode("utf-8", errors="ignore")}')
-                return None
-
-            # If we read fewer frames than expected, pad with black frames to match total_tiles
-            if len(frames) < self.total_tiles:
-                black = np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
-                while len(frames) < self.total_tiles:
-                    frames.append(black)
-
-            return frames
-
-        except Exception as ex:
-            logging.warning(f'{self.file_path}: Error while reading FFmpeg output:', exc_info=ex)
-            try:
-                process.kill()
-                process.communicate()
-            except Exception:
-                pass
-            return None
-
 
     def __extractAndScoreFrames(
         self,
@@ -722,180 +662,393 @@ class ThumbnailGenerator:
             # 結果を格納するリスト
             scoring_width, scoring_height = self.SCORING_SCALE
             bgr_frames: list[NDArray[np.uint8]] = []
+            consecutive_failed_frames = 0
 
             # MPEG-TS の場合は format を明示的に指定
             format_name = 'mpegts' if self.container_format == 'MPEG-TS' else None
 
-            # まずは FFmpeg を用いたシーケンシャル抽出を試みる（seek の多発を避け I/O を改善するため）
-            ffmpeg_frames = self._extractFramesWithFFmpeg(candidate_offsets)
-            if ffmpeg_frames is not None:
-                bgr_frames = ffmpeg_frames
-                logging.info(f'{self.file_path}: All {len(bgr_frames)} frames extraction completed via FFmpeg. ({time.time() - start_time_frame_extraction:.2f} sec)')
-            else:
-                # Fallback: PyAV による per-offset seek 抽出
-                container = av.open(str(self.file_path), format=format_name)
-                # PyAV で video stream が存在しない場合は、明示的にエラーとして扱う
-                if len(container.streams.video) == 0:
-                    logging.error(f'{self.file_path}: No video stream found in ThumbnailGenerator.')
-                    raise ValueError('No video stream found in ThumbnailGenerator.')
-                video_stream = container.streams.video[0]
-                try:
-                    # コンテナは 1 回だけ開き、各フレーム抽出で seek を繰り返す
-                    ## MPEG-TS でも実測で問題なければ再オープンを避けられるため、まずは 1 回オープンで検証する
-                    # I フレームのみデコードする設定（FFmpeg の -skip_frame nointra 相当）
-                    video_stream.codec_context.skip_frame = 'NONINTRA'
+            # シーケンシャルにフレームを抽出（HDD への負荷を考慮）
+            container = av.open(str(self.file_path), format=format_name)
+            # PyAV で video stream が存在しない場合は、明示的にエラーとして扱う
+            if len(container.streams.video) == 0:
+                logging.error(f'{self.file_path}: No video stream found in ThumbnailGenerator.')
+                raise ValueError('No video stream found in ThumbnailGenerator.')
+            video_stream = container.streams.video[0]
+            try:
+                # コンテナは 1 回だけ開き、各フレーム抽出で seek を繰り返す
+                ## MPEG-TS でも実測で問題なければ再オープンを避けられるため、まずは 1 回オープンで検証する
+                # I フレームのみデコードする設定（FFmpeg の -skip_frame nointra 相当）
+                video_stream.codec_context.skip_frame = 'NONINTRA'
 
-                    for i, offset_sec in enumerate(candidate_offsets):
-                        try:
-                            # 指定位置にシーク
-                            # MPEG-TS では start_time が 0 から始まらないことがあるため、start_time を考慮する必要がある
-                            # start_time は pts 単位（90kHz クロックで表現された開始位置）なので、
-                            # offset_sec を pts 単位に変換してから start_time を加算する
-                            if video_stream.time_base is None:
-                                # time_base が None の場合はコンテナ形式に応じてフォールバックする
-                                if self.container_format == 'MPEG-TS':
-                                    time_base = 1 / 90000
-                                    logging.warning(f'{self.file_path}: time_base is None in ThumbnailGenerator, using fallback: {time_base}')
-                                else:
-                                    logging.error(f'{self.file_path}: time_base is None in ThumbnailGenerator for non-TS container.')
-                                    raise ValueError('time_base is None in ThumbnailGenerator for non-TS container.')
+                for i, offset_sec in enumerate(candidate_offsets):
+                    try:
+                        # 指定位置にシーク
+                        # MPEG-TS では start_time が 0 から始まらないことがあるため、start_time を考慮する必要がある
+                        # start_time は pts 単位（90kHz クロックで表現された開始位置）なので、
+                        # offset_sec を pts 単位に変換してから start_time を加算する
+                        if video_stream.time_base is None:
+                            # time_base が None の場合はコンテナ形式に応じてフォールバックする
+                            if self.container_format == 'MPEG-TS':
+                                time_base = 1 / 90000
+                                logging.warning(f'{self.file_path}: time_base is None in ThumbnailGenerator, using fallback: {time_base}')
                             else:
-                                time_base = float(video_stream.time_base)
-                            start_time = video_stream.start_time if video_stream.start_time else 0
-                            target_ts = int(start_time + offset_sec / time_base)
-                            container.seek(target_ts, backward=True, any_frame=False, stream=video_stream)
+                                logging.error(f'{self.file_path}: time_base is None in ThumbnailGenerator for non-TS container.')
+                                raise ValueError('time_base is None in ThumbnailGenerator for non-TS container.')
+                        else:
+                            time_base = float(video_stream.time_base)
+                        start_time = video_stream.start_time if video_stream.start_time else 0
+                        target_ts = int(start_time + offset_sec / time_base)
+                        container.seek(target_ts, backward=True, any_frame=False, stream=video_stream)
 
-                            # seek 後のデコーダ内部状態を初期化し、前回のデコード状態を引きずらないようにする
-                            video_stream.codec_context.flush_buffers()
+                        # seek 後のデコーダ内部状態を初期化し、前回のデコード状態を引きずらないようにする
+                        video_stream.codec_context.flush_buffers()
 
-                            # シーク後、最初のフレームを取得
-                            frame: av.VideoFrame | None = None
-                            for packet in container.demux(video_stream):
-                                for decoded_frame in packet.decode():
-                                    frame = cast(av.VideoFrame, decoded_frame)
-                                    break
-                                if frame is not None:
-                                    break
+                        # シーク後、最初のフレームを取得
+                        ## 映像 PID が途中で変わる TS では、最初に掴んだ video_stream が後半でフレームを返さず、
+                        ## ファイル末尾まで走査してしまうことがあるため、候補1つあたりの探索量を制限する
+                        frame: av.VideoFrame | None = None
+                        for packet_index, packet in enumerate(container.demux(video_stream)):
+                            if packet_index >= self.FRAME_EXTRACTION_MAX_DEMUX_PACKETS:
+                                break
+                            for decoded_frame in packet.decode():
+                                frame = cast(av.VideoFrame, decoded_frame)
+                                break
+                            if frame is not None:
+                                break
 
-                            if frame is None:
-                                # フレームが取得できなかった場合は黒画像を使用
-                                logging.warning(f'{self.file_path}: Failed to extract frame at {offset_sec:.2f}s. Using black image.')
-                                black_frame = np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
-                                bgr_frames.append(black_frame)
-                                continue
-
-                            # フレームを numpy 配列に変換
-                            img_rgb = frame.to_ndarray(format='rgb24')
-
-                            # リサイズを実行
-                            ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
-                            img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-
-                            # RGB から OpenCV 向けの BGR に変換して bgr_frames に追加する
-                            img_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
-                            bgr_frames.append(img_bgr)
-
-                            # 進捗ログ（50フレームごと）
-                            if (i + 1) % 50 == 0:
-                                logging.debug(f'{self.file_path}: Extracted {i + 1}/{len(candidate_offsets)} frames')
-
-                        except Exception as ex:
-                            # 個別のフレーム抽出エラーは警告にとどめ、黒画像で代替
-                            logging.warning(
-                                f'{self.file_path}: Error extracting frame at {offset_sec:.2f}s.',
-                                exc_info=ex,
-                            )
+                        if frame is None:
+                            # フレームが取得できなかった場合は黒画像を使用
+                            logging.warning(f'{self.file_path}: Failed to extract frame at {offset_sec:.2f}s. Using black image.')
                             black_frame = np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
                             bgr_frames.append(black_frame)
-
-                            # 一時的なデマルチプレクサの不調を想定し、念のためコンテナを再オープンして継続
-                            try:
-                                container.close()
-                            except Exception as close_ex:
+                            consecutive_failed_frames += 1
+                            if consecutive_failed_frames >= self.FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES:
+                                # 連続失敗後も全候補でシークを続けると、異常 TS で数十分単位の処理になる
+                                ## 既に取得済みの前半フレームは代表サムネ候補として使えるため、残りは黒画像で埋めて処理を終える
+                                remaining_frame_count = len(candidate_offsets) - len(bgr_frames)
+                                if remaining_frame_count > 0:
+                                    bgr_frames.extend(
+                                        np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
+                                        for _ in range(remaining_frame_count)
+                                    )
                                 logging.warning(
-                                    f'{self.file_path}: Failed to close container after error.',
-                                    exc_info=close_ex,
+                                    f'{self.file_path}: Stopped frame extraction after consecutive failures. '
+                                    f'[failed_count: {consecutive_failed_frames}, filled_black_frames: {remaining_frame_count}]'
                                 )
-                            try:
-                                container = av.open(str(self.file_path), format=format_name)
-                                video_stream = container.streams.video[0]
-                                video_stream.codec_context.skip_frame = 'NONINTRA'
-                            except Exception as reopen_ex:
-                                logging.error(
-                                    f'{self.file_path}: Failed to reopen container after error.',
-                                    exc_info=reopen_ex,
+                                break
+                            continue
+
+                        # フレームを numpy 配列に変換
+                        img_rgb = frame.to_ndarray(format='rgb24')
+
+                        # リサイズを実行
+                        ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
+                        img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
+
+                        # RGB から OpenCV 向けの BGR に変換して bgr_frames に追加する
+                        img_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+                        bgr_frames.append(img_bgr)
+                        consecutive_failed_frames = 0
+
+                        # 進捗ログ（50フレームごと）
+                        if (i + 1) % 50 == 0:
+                            logging.debug(f'{self.file_path}: Extracted {i + 1}/{len(candidate_offsets)} frames')
+
+                    except Exception as ex:
+                        # 個別のフレーム抽出エラーは警告にとどめ、黒画像で代替
+                        logging.warning(
+                            f'{self.file_path}: Error extracting frame at {offset_sec:.2f}s.',
+                            exc_info=ex,
+                        )
+                        black_frame = np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
+                        bgr_frames.append(black_frame)
+                        consecutive_failed_frames += 1
+
+                        if consecutive_failed_frames >= self.FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES:
+                            # 例外が連続する場合も同じく異常 TS とみなし、残り候補の逐次シークを打ち切る
+                            remaining_frame_count = len(candidate_offsets) - len(bgr_frames)
+                            if remaining_frame_count > 0:
+                                bgr_frames.extend(
+                                    np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
+                                    for _ in range(remaining_frame_count)
                                 )
-                                return None
-                finally:
-                    container.close()
+                            logging.warning(
+                                f'{self.file_path}: Stopped frame extraction after consecutive errors. '
+                                f'[failed_count: {consecutive_failed_frames}, filled_black_frames: {remaining_frame_count}]'
+                            )
+                            break
 
-                logging.info(f'{self.file_path}: All {len(bgr_frames)} frames extraction completed. ({time.time() - start_time_frame_extraction:.2f} sec)')
+                        # 一時的なデマルチプレクサの不調を想定し、念のためコンテナを再オープンして継続
+                        try:
+                            container.close()
+                        except Exception as close_ex:
+                            logging.warning(
+                                f'{self.file_path}: Failed to close container after error.',
+                                exc_info=close_ex,
+                            )
+                        try:
+                            container = av.open(str(self.file_path), format=format_name)
+                            video_stream = container.streams.video[0]
+                            video_stream.codec_context.skip_frame = 'NONINTRA'
+                        except Exception as reopen_ex:
+                            logging.error(
+                                f'{self.file_path}: Failed to reopen container after error.',
+                                exc_info=reopen_ex,
+                            )
+                            return None
+            finally:
+                container.close()
 
-            # ========== スコアリング処理 ==========
+            logging.info(f'{self.file_path}: All {len(bgr_frames)} frames extraction completed. ({time.time() - start_time_frame_extraction:.2f} sec)')
 
-            start_time_scoring = time.time()
-
-            # 顔検出器のロード (必要な場合のみ)
-            face_cascade = None
-            auxiliary_face_cascade = None
-            if self.face_detection_mode == 'Human':
-                face_cascade = cv2.CascadeClassifier(str(self.HUMAN_FACE_CASCADE_PATH))
-            elif self.face_detection_mode == 'Anime':
-                face_cascade = cv2.CascadeClassifier(str(self.ANIME_FACE_CASCADE_PATH))
-                # アニメ顔検出時は精度向上のため、実写顔検出器を併用
-                auxiliary_face_cascade = cv2.CascadeClassifier(str(self.HUMAN_FACE_CASCADE_PATH))
-
-            # 候補区間内のフレームを収集してスコアリング
-            # (index, score, found_face) のリスト
-            scored_frames: list[tuple[int, float, bool]] = []
-            total_frames = len(bgr_frames)
-            cols = self.tile_cols
-            for idx in range(total_frames):
-                # このフレームの動画内時間(秒)
-                time_offset = idx * self.tile_interval_sec
-                # 候補区間に含まれているかどうか
-                if not self.__inCandidateIntervals(time_offset):
-                    continue
-
-                # タイル上の座標（ログ出力用）
-                row = idx // cols + 1
-                col = idx % cols + 1
-
-                # スコアを計算
-                frame_bgr = bgr_frames[idx]
-                score, found_face = self.__computeImageScore(frame_bgr, face_cascade, auxiliary_face_cascade, row, col)
-                scored_frames.append((idx, score, found_face))
-
-            # 最良フレームのインデックスを特定
-            best_frame_index: int | None = None
-            if scored_frames:
-                # 顔ありフレームだけ抜き出す
-                face_frames = [(idx, sc, True) for (idx, sc, f) in scored_frames if f]
-
-                if self.face_detection_mode is not None and face_frames:
-                    # 顔ありのみから最大スコアを選ぶ
-                    best_idx, _, _ = max(face_frames, key=lambda x: x[1])
-                    best_row = best_idx // cols + 1
-                    best_col = best_idx % cols + 1
-                    logging.debug(f'Best frame selected. (face found / row:{best_row}, col:{best_col})')
-                    best_frame_index = best_idx
-                else:
-                    # 顔検出無し or 一つも顔が見つからなかった場合
-                    best_idx, _, _ = max(scored_frames, key=lambda x: x[1])
-                    best_row = best_idx // cols + 1
-                    best_col = best_idx % cols + 1
-                    logging.debug(f'Best frame selected. (face not found / row:{best_row}, col:{best_col})')
-                    best_frame_index = best_idx
-            else:
-                # 候補区間内のフレームが1枚もない場合
-                logging.warning(f'{self.file_path}: No frames found in candidate intervals.')
-
-            logging.info(f'{self.file_path}: Frame scoring completed. ({time.time() - start_time_scoring:.2f} sec)')
-            return (bgr_frames, best_frame_index)
+            # フレーム抽出方法に関わらず、共通の代表サムネイル選定処理を適用する
+            return (bgr_frames, self.__scoreFrames(bgr_frames))
 
         except Exception as ex:
             logging.error(f'{self.file_path}: Error in PyAV frame extraction and scoring:', exc_info=ex)
             return None
+
+
+    def __extractAndScoreFramesWithTSReadEx(
+        self,
+        candidate_offsets: list[float],
+    ) -> tuple[list[NDArray[np.uint8]], int | None] | None:
+        """
+        tsreadex 経由の TS を PyAV で順次デコードし、候補区間内のフレームをスコアリングして最良フレームを特定する
+
+        Args:
+            candidate_offsets (list[float]): 抽出するフレームのタイムスタンプ (秒) のリスト
+
+        Returns:
+            tuple[list[NDArray[np.uint8]], int | None] | None:
+                - 全フレームの BGR 配列リスト (SCORING_SCALE)
+                - 最良フレームのインデックス (候補区間内にフレームがない場合は None)
+                - エラー時は None
+        """
+
+        tsreadex_process: subprocess.Popen[bytes] | None = None
+        container: Any | None = None
+        try:
+            start_time_frame_extraction = time.time()
+            scoring_width, scoring_height = self.SCORING_SCALE
+            expected_frame_count = len(candidate_offsets)
+
+            # 再生時同様の設定で TS ストリームに tsreadex を適用し、途中で映像 PID が変わる TS を1本の映像ストリームとして扱う
+            ## PyAV に -scan_all_pmts 相当のオプションを指定したが、PyAV/FFmpeg 側が Bus error で落ちてしまったため、
+            ## FFmpeg 単独で解決するのは諦め、tsreadex を間に挟むようにしている
+            service_id = self.service_id if self.service_id is not None else -1
+            tsreadex_options = [
+                LIBRARY_PATH['tsreadex'],
+                # EIT などサムネイル生成に不要な PSI/SI パケットを除外する
+                '-x', '18/38/39',
+                # 対象サービスだけを出力し、映像 PID の変化を tsreadex 側で吸収する
+                '-n', f'{service_id}',
+                # 主音声ストリームが常に存在する状態にする
+                ## ストリームが存在しない場合、無音の AAC ストリームが出力される
+                ## 音声がモノラルであればステレオにする
+                ## デュアルモノを2つのモノラル音声に分離し、右チャンネルを副音声として扱う
+                '-a', '13',
+                # 副音声ストリームが常に存在する状態にする
+                ## ストリームが存在しない場合、無音の AAC ストリームが出力される
+                ## 音声がモノラルであればステレオにする
+                '-b', '7',
+                # 字幕ストリームが常に存在する状態にする
+                ## ストリームが存在しない場合、PMT の項目が補われて出力される
+                ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
+                '-c', '5',
+                # 文字スーパーストリームが常に存在する状態にする
+                ## ストリームが存在しない場合、PMT の項目が補われて出力される
+                '-u', '1',
+                # 字幕と文字スーパーを aribb24.js が解釈できる ID3 timed-metadata に変換する
+                ## +4: FFmpeg のバグを打ち消すため、変換後のストリームに規格外の5バイトのデータを追加する
+                ## +8: FFmpeg のエラーを防ぐため、変換後のストリームの PTS が単調増加となるように調整する
+                '-d', '9',
+                str(self.file_path),
+            ]
+
+            tsreadex_process = subprocess.Popen(
+                tsreadex_options,
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+            )
+            if tsreadex_process.stdout is None:
+                logging.error(f'{self.file_path}: Failed to open tsreadex stdout pipe.')
+                return None
+
+            # パイプ入力は seek できないため、tsreadex の出力を先頭から順次デコードする
+            ## 通常経路の backward seek に近づけるため、候補時刻を超えた時点で直前の I フレームを採用する
+            container_for_read = cast(Any, av.open(tsreadex_process.stdout, format='mpegts'))
+            container = container_for_read
+            if len(container_for_read.streams.video) == 0:
+                logging.error(f'{self.file_path}: No video stream found in tsreadex output.')
+                return None
+            video_stream = container_for_read.streams.video[0]
+
+            # I フレームのみデコードする設定（FFmpeg の -skip_frame nointra 相当）
+            video_stream.codec_context.skip_frame = 'NONINTRA'
+
+            first_frame_time: float | None = None
+            previous_frame_bgr: NDArray[np.uint8] | None = None
+            previous_frame_relative_time: float | None = None
+            bgr_frames: list[NDArray[np.uint8]] = []
+            next_candidate_index = 0
+            for decoded_frame in container_for_read.decode(video_stream):
+                if time.time() - start_time_frame_extraction > self.TSREADEX_FRAME_EXTRACTION_TIMEOUT:
+                    logging.error(
+                        f'{self.file_path}: tsreadex frame extraction timed out after '
+                        f'{self.TSREADEX_FRAME_EXTRACTION_TIMEOUT} seconds.'
+                    )
+                    return None
+                if decoded_frame.time is None:
+                    continue
+                if first_frame_time is None:
+                    first_frame_time = float(decoded_frame.time)
+                relative_time = float(decoded_frame.time) - first_frame_time
+
+                # 既存のスコアリング入力と同じ解像度に縮小し、次の候補時刻をまたいだ時に直前フレームとして使う
+                img_rgb = decoded_frame.to_ndarray(format='rgb24')
+                img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
+                bgr_frame = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+
+                # 候補時刻を超えた場合、通常経路の backward seek と同じく直前の I フレームを採用する
+                ## 先頭だけは直前フレームが存在しないため、最初に取得できた I フレームを使う
+                while next_candidate_index < expected_frame_count and relative_time + 0.001 >= candidate_offsets[next_candidate_index]:
+                    if previous_frame_bgr is not None:
+                        bgr_frames.append(previous_frame_bgr.copy())
+                    else:
+                        bgr_frames.append(bgr_frame.copy())
+                    next_candidate_index += 1
+
+                previous_frame_bgr = bgr_frame
+                previous_frame_relative_time = relative_time
+
+                # 必要な候補枚数を取得したら、tsreadex 側の入力パイプを閉じて処理を終える
+                if next_candidate_index >= expected_frame_count:
+                    break
+
+            # 最後の I フレーム以降に残った候補は、通常経路の backward seek と同じく末尾側の直前フレームで埋める
+            ## デコード済みフレームが1枚もない場合は、後続の不足補完で黒画像にする
+            while (
+                next_candidate_index < expected_frame_count and
+                previous_frame_bgr is not None and
+                previous_frame_relative_time is not None
+            ):
+                bgr_frames.append(previous_frame_bgr.copy())
+                next_candidate_index += 1
+
+            # 末尾までに候補数へ届かない場合でもタイル枚数を維持し、保存処理の前提を崩さない
+            missing_frame_count = expected_frame_count - len(bgr_frames)
+            if missing_frame_count > 0:
+                logging.warning(
+                    f'{self.file_path}: tsreadex frame extraction produced fewer frames than expected. '
+                    f'[expected: {expected_frame_count}, actual: {len(bgr_frames)}]'
+                )
+                bgr_frames.extend(
+                    np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
+                    for _ in range(missing_frame_count)
+                )
+
+            logging.info(
+                f'{self.file_path}: tsreadex extracted {len(bgr_frames)} frames. '
+                f'({time.time() - start_time_frame_extraction:.2f} sec)'
+            )
+
+            # フレーム抽出方法に関わらず、共通の代表サムネイル選定処理を適用する
+            return (bgr_frames, self.__scoreFrames(bgr_frames))
+
+        except Exception as ex:
+            logging.error(f'{self.file_path}: Error in tsreadex frame extraction and scoring:', exc_info=ex)
+            return None
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception as ex:
+                    logging.warning(f'{self.file_path}: Failed to close PyAV container.', exc_info=ex)
+            if tsreadex_process is not None:
+                if tsreadex_process.returncode is None:
+                    tsreadex_process.kill()
+                if tsreadex_process.stdout is not None:
+                    try:
+                        tsreadex_process.stdout.close()
+                    except Exception as ex:
+                        logging.warning(f'{self.file_path}: Failed to close tsreadex stdout pipe.', exc_info=ex)
+                try:
+                    tsreadex_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logging.warning(f'{self.file_path}: tsreadex process did not stop within timeout.')
+
+
+    def __scoreFrames(self, bgr_frames: list[NDArray[np.uint8]]) -> int | None:
+        """
+        候補区間内のフレームをスコアリングし、代表サムネイルに使うフレームのインデックスを返す
+
+        Args:
+            bgr_frames (list[NDArray[np.uint8]]): BGR フレームのリスト (SCORING_SCALE)
+
+        Returns:
+            int | None: 最良フレームのインデックス (候補区間内にフレームがない場合は None)
+        """
+
+        start_time_scoring = time.time()
+
+        # 顔検出器のロード (必要な場合のみ)
+        face_cascade = None
+        auxiliary_face_cascade = None
+        if self.face_detection_mode == 'Human':
+            face_cascade = cv2.CascadeClassifier(str(self.HUMAN_FACE_CASCADE_PATH))
+        elif self.face_detection_mode == 'Anime':
+            face_cascade = cv2.CascadeClassifier(str(self.ANIME_FACE_CASCADE_PATH))
+            # アニメ顔検出時は精度向上のため、実写顔検出器を併用
+            auxiliary_face_cascade = cv2.CascadeClassifier(str(self.HUMAN_FACE_CASCADE_PATH))
+
+        # 候補区間内のフレームを収集してスコアリング
+        # (index, score, found_face) のリスト
+        scored_frames: list[tuple[int, float, bool]] = []
+        total_frames = len(bgr_frames)
+        cols = self.tile_cols
+        for idx in range(total_frames):
+            # このフレームの動画内時間(秒)
+            time_offset = idx * self.tile_interval_sec
+            # 候補区間に含まれているかどうか
+            if not self.__inCandidateIntervals(time_offset):
+                continue
+
+            # タイル上の座標（ログ出力用）
+            row = idx // cols + 1
+            col = idx % cols + 1
+
+            # スコアを計算
+            frame_bgr = bgr_frames[idx]
+            score, found_face = self.__computeImageScore(frame_bgr, face_cascade, auxiliary_face_cascade, row, col)
+            scored_frames.append((idx, score, found_face))
+
+        # 最良フレームのインデックスを特定
+        best_frame_index: int | None = None
+        if scored_frames:
+            # 顔ありフレームだけ抜き出す
+            face_frames = [(idx, sc, True) for (idx, sc, f) in scored_frames if f]
+
+            if self.face_detection_mode is not None and face_frames:
+                # 顔ありのみから最大スコアを選ぶ
+                best_idx, _, _ = max(face_frames, key=lambda x: x[1])
+                best_row = best_idx // cols + 1
+                best_col = best_idx % cols + 1
+                logging.debug(f'Best frame selected. (face found / row:{best_row}, col:{best_col})')
+                best_frame_index = best_idx
+            else:
+                # 顔検出無し or 一つも顔が見つからなかった場合
+                best_idx, _, _ = max(scored_frames, key=lambda x: x[1])
+                best_row = best_idx // cols + 1
+                best_col = best_idx % cols + 1
+                logging.debug(f'Best frame selected. (face not found / row:{best_row}, col:{best_col})')
+                best_frame_index = best_idx
+        else:
+            # 候補区間内のフレームが1枚もない場合
+            logging.warning(f'{self.file_path}: No frames found in candidate intervals.')
+
+        logging.info(f'{self.file_path}: Frame scoring completed. ({time.time() - start_time_scoring:.2f} sec)')
+        return best_frame_index
 
 
     def __saveRepresentativeThumbnail(self, img_bgr: NDArray[np.uint8]) -> bool:
@@ -1225,18 +1378,27 @@ class ThumbnailGenerator:
         # ProcessPoolExecutor を使用して別プロセスで画像変換を実行
         ## 画像処理は CPU-bound な処理のため、別プロセスで実行している
         ## anyio.Path は同期関数では実行できないため、pathlib.Path に変換して渡す
+        ## キャンセル時に同期的な終了待機へ入るとイベントループ全体が止まるため、Executor は明示的に閉じる
         loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+        should_wait_executor = True
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-                success = await loop.run_in_executor(
-                    executor,
-                    self._convertLegacyTileImage,
-                    pathlib.Path(str(output_tile_path)),
-                    pathlib.Path(str(temp_tile_path)),
-                )
+            success = await loop.run_in_executor(
+                executor,
+                self._convertLegacyTileImage,
+                pathlib.Path(str(output_tile_path)),
+                pathlib.Path(str(temp_tile_path)),
+            )
+        except asyncio.CancelledError:
+            should_wait_executor = False
+            await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
+            raise
         except Exception as ex:
             logging.error(f'{self.file_path}: Error converting legacy tile:', exc_info=ex)
             return False
+        finally:
+            if should_wait_executor is True:
+                await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
 
         # 変換失敗時はエラーログを出力して終了
         if not success:
@@ -1952,11 +2114,6 @@ if __name__ == "__main__":
             "-f",
             help="顔検出モード (Human/Anime) / 指定しない場合はメタデータから自動取得",
         ),
-        max_analyze: float | None = typer.Option(
-            None,
-            "--max-analyze",
-            help="解析する最大秒数（デフォルト: 600 秒） / 指定しない場合は設定のデフォルトを使用",
-        ),
     ) -> None:
         """
         録画ファイルからサムネイルを生成する
@@ -1984,20 +2141,6 @@ if __name__ == "__main__":
             generator.candidate_intervals = [(candidate_start, candidate_end)]
         if face_detection_mode is not None:
             generator.face_detection_mode = face_detection_mode
-        if max_analyze is not None:
-            # インスタンス単位で解析上限を上書き（クラス変数は変更しない）
-            generator.analysis_duration = min(generator.duration_sec, float(max_analyze))
-            # 候補区間を解析ウィンドウにクリップし、レイアウトを再計算
-            clipped_intervals: list[tuple[float, float]] = []
-            for (s, e) in generator.candidate_intervals:
-                if e <= 0 or s >= generator.analysis_duration:
-                    continue
-                ns = max(0.0, s)
-                ne = min(generator.analysis_duration, e)
-                if ne > ns:
-                    clipped_intervals.append((ns, ne))
-            generator.candidate_intervals = clipped_intervals
-            generator._recalculateAnalysisLayout()
 
         # サムネイルを生成
         asyncio.run(generator.generateAndSave())

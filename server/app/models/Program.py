@@ -10,7 +10,6 @@ import json
 import time
 from datetime import datetime, timedelta
 from typing import Any, cast
-from zoneinfo import ZoneInfo
 
 import ariblib.constants
 import httpx
@@ -20,10 +19,10 @@ from tortoise.models import Model as TortoiseModel
 
 from app import logging
 from app.config import Config, LoadConfig
-from app.constants import DATABASE_CONFIG, HTTPX_CLIENT
+from app.constants import DATABASE_CONFIG, HTTPX_CLIENT, JST
 from app.models.Channel import Channel
 from app.schemas import Genre
-from app.utils import GetMirakurunAPIEndpointURL
+from app.utils import GetMirakurunAPIEndpointURL, ShutdownProcessPoolExecutor
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.edcb.EDCBUtil import EDCBUtil
 from app.utils.TSInformation import TSInformation
@@ -80,25 +79,40 @@ class Program(TortoiseModel):
             loop = asyncio.get_running_loop()
 
             # マルチプロセス実行用の Executor を初期化
-            ## with 文で括ることで、with 文を抜けたときに Executor がクリーンアップされるようにする
-            ## さもなければプロセスが残り続けてゾンビプロセス化し、メモリリークを引き起こしてしまう
+            ## ProcessPoolExecutor のコンテキストマネージャーは、キャンセル時にも __exit__() で子プロセスの終了を同期的に待つ
+            ## 番組情報更新中に API リクエストやバックグラウンドタスクがキャンセルされても、イベントループ全体を止めないように明示的に閉じる
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+            should_wait_executor = True
             try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+                # Mirakurun バックエンド
+                if Config().general.backend == 'Mirakurun':
+                    await loop.run_in_executor(executor, cls.updateFromMirakurunForMultiProcess)
 
-                    # Mirakurun バックエンド
-                    if Config().general.backend == 'Mirakurun':
-                        await loop.run_in_executor(executor, cls.updateFromMirakurunForMultiProcess)
+                # EDCB バックエンド
+                elif Config().general.backend == 'EDCB':
+                    await loop.run_in_executor(executor, cls.updateFromEDCBForMultiProcess)
 
-                    # EDCB バックエンド
-                    elif Config().general.backend == 'EDCB':
-                        await loop.run_in_executor(executor, cls.updateFromEDCBForMultiProcess)
+            # タスクキャンセル時は子プロセスの終了を待たず、イベントループを即座に呼び出し元へ返す
+            ## Python 3.11 の ProcessPoolExecutor は実行中の処理を即時終了できないため、子プロセス自体は完了まで残る可能性がある
+            except asyncio.CancelledError:
+                should_wait_executor = False
+                await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
+                raise
 
             # データベースが他のプロセスにロックされていた場合
             # 5秒待ってからリトライ
             except exceptions.OperationalError:
+                # 子プロセス側の処理は例外として戻ってきているため、リトライ前にこの試行の Executor を閉じる
+                ## 閉じる前に再帰呼び出しへ進むと、リトライ中も前回試行のプロセス管理リソースが残る
+                should_wait_executor = False
+                await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
                 await asyncio.sleep(5)
                 await cls.update(multiprocess=multiprocess)
                 return
+
+            finally:
+                if should_wait_executor is True:
+                    await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
 
         # 番組情報をシングルプロセスで更新する
         else:
@@ -176,7 +190,7 @@ class Program(TortoiseModel):
             """
 
             # タイムゾーンを UTC+9（日本時間）に指定する
-            return datetime.fromtimestamp(millisecond / 1000, tz=ZoneInfo('Asia/Tokyo'))
+            return datetime.fromtimestamp(millisecond / 1000, tz=JST)
 
         # マルチプロセス時は既存のコネクションが使えないため、Tortoise ORM を初期化し直す
         # ref: https://tortoise-orm.readthedocs.io/en/latest/setup.html
@@ -271,7 +285,7 @@ class Program(TortoiseModel):
                     end_time = MillisecondToDatetime(program_info['startAt'] + program_info['duration'])
 
                     # 番組終了時刻が現在時刻より12時間以上前な番組を弾く
-                    if datetime.now(ZoneInfo('Asia/Tokyo')) - end_time > timedelta(hours=12):
+                    if datetime.now(JST) - end_time > timedelta(hours=12):
                         continue
 
                     # ***** ここからは 追加・更新・更新不要 のいずれか *****
@@ -568,7 +582,7 @@ class Program(TortoiseModel):
 
                         # 番組開始時刻
                         ## 万が一取得できなかった場合は 1970/1/1 9:00 とする
-                        start_time = event_info.get('start_time', datetime(1970, 1, 1, 9, tzinfo=ZoneInfo('Asia/Tokyo')))
+                        start_time = event_info.get('start_time', datetime(1970, 1, 1, 9, tzinfo=JST))
 
                         # 番組終了時刻
                         ## 終了時間未定の場合、とりあえず5分とする

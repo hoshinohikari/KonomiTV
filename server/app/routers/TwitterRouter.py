@@ -1,9 +1,8 @@
 
-import asyncio
-from collections.abc import Coroutine
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
+from urllib.parse import urlparse
 
-import tweepy
+import httpx
 from fastapi import (
     APIRouter,
     Body,
@@ -13,11 +12,15 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
+    Request,
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from app import logging, schemas
+from app.constants import API_REQUEST_HEADERS
 from app.models.TwitterAccount import TwitterAccount
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentUser
@@ -30,6 +33,70 @@ router = APIRouter(
     tags = ['Twitter'],
     prefix = '/api/twitter',
 )
+
+def ParseAcceptLanguageHeader(accept_language: str | None) -> list[str]:
+    """
+    Accept-Language ヘッダーを CDP に渡しやすい言語タグ配列へ変換する
+
+    Args:
+        accept_language (str | None): HTTP リクエストの Accept-Language ヘッダー
+
+    Returns:
+        list[str]: q 値などの重みを除去した言語タグ配列
+    """
+
+    # CDP の acceptLanguage は q 値付き文字列を渡すと Chrome 側で q 値が二重化するため、
+    # 保存時点でヘッダーの生値とは別に q 値を除いた配列を持っておく
+    if accept_language is None:
+        return []
+
+    language_tags: list[str] = []
+    for language_part in accept_language.split(','):
+        # `ja-JP;q=0.9` のような重み部分は CDP へ渡す値には不要なので、先頭の言語タグだけを使う
+        language_tag = language_part.strip().split(';', maxsplit=1)[0].strip()
+        if language_tag != '':
+            language_tags.append(language_tag)
+    return language_tags
+
+
+def BuildCookieBrowserInfo(
+    request: Request,
+    browser_info: schemas.BrowserEnvironmentInfoRequest | None,
+) -> schemas.BrowserEnvironmentInfo | None:
+    """
+    Cookie 認証 API の HTTP リクエストヘッダーと、クライアント側で採取した情報から、
+    TwitterAccount.cookie_browser_info に永続化するヘッドレスブラウザ向けの環境情報を組み立てる
+
+    Args:
+        request (Request): Twitter Cookie 認証 API のリクエスト
+        browser_info (schemas.BrowserEnvironmentInfoRequest | None): クライアント JavaScript で採取した環境情報
+
+    Returns:
+        schemas.BrowserEnvironmentInfo | None: 永続化するヘッドレスブラウザ向けの環境情報
+    """
+
+    # UA-CH 高エントロピー値が取れないブラウザでは補正に必要な OS 情報が不足しているため諦める
+    if browser_info is None:
+        return None
+
+    # Accept-Language は navigator.languages より実際の HTTP リクエストヘッダーから解析した方が正確なので、サーバー側で直接採取する
+    ## sec-ch-ua 系の低エントロピー値も同じ HTTP リクエストヘッダーから保存しておき、後で実ブラウザ側の送信値と比較できるようにする
+    accept_language = request.headers.get('accept-language')
+    cookie_browser_info = schemas.BrowserEnvironmentInfo(
+        http_headers=schemas.BrowserEnvironmentHTTPHeaders(
+            user_agent=request.headers.get('user-agent'),
+            accept_language=accept_language,
+            accept_languages=ParseAcceptLanguageHeader(accept_language),
+            sec_ch_ua=request.headers.get('sec-ch-ua'),
+            sec_ch_ua_mobile=request.headers.get('sec-ch-ua-mobile'),
+            sec_ch_ua_platform=request.headers.get('sec-ch-ua-platform'),
+        ),
+        user_agent_data=browser_info.user_agent_data,
+        navigator_platform=browser_info.navigator_platform,
+        locale=browser_info.locale,
+        timezone=browser_info.timezone,
+    )
+    return cookie_browser_info
 
 
 async def GetCurrentTwitterAccount(
@@ -90,6 +157,7 @@ async def GetCurrentTwitterAccount(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 async def TwitterCookieAuthAPI(
+    request: Request,
     auth_request: Annotated[schemas.TwitterCookieAuthRequest, Body(description='Twitter 認証リクエスト')],
     current_user: Annotated[User, Depends(GetCurrentUser)],
 ):
@@ -121,6 +189,10 @@ async def TwitterCookieAuthAPI(
             detail = 'No valid cookies found in the provided cookies.txt',
         )
 
+    # Cookie 認証 API の HTTP リクエストヘッダーと、クライアント JavaScript で採取した情報から、
+    # TwitterAccount.cookie_browser_info に永続化するヘッドレスブラウザ向けの環境情報を組み立てる
+    cookie_browser_info = BuildCookieBrowserInfo(request, auth_request.browser_info)
+
     # TwitterAccount のレコードを作成
     ## アクセストークンは "NETSCAPE_COOKIE_FILE" の固定値、
     ## アクセストークンシークレットとして Netscape 形式の Cookie ファイルの内容をそのまま保存する
@@ -134,6 +206,8 @@ async def TwitterCookieAuthAPI(
         access_token = 'NETSCAPE_COOKIE_FILE',
         # Netscape 形式の Cookie ファイルの内容をそのまま保存
         access_token_secret = auth_request.cookies_txt,
+        # Cookie 採取元ブラウザの環境情報
+        cookie_browser_info = cookie_browser_info,
     )
 
     # 一時的に作成した TwitterAccount ORM インスタンスの ID (通常 None) を控えておき、後段でシングルトンを付け替える
@@ -192,6 +266,7 @@ async def TwitterCookieAuthAPI(
         oldest_account.icon_url = twitter_account.icon_url  # アイコン URL
         oldest_account.access_token = twitter_account.access_token  # アクセストークン
         oldest_account.access_token_secret = twitter_account.access_token_secret  # アクセストークンシークレット
+        oldest_account.cookie_browser_info = twitter_account.cookie_browser_info  # Cookie 採取元ブラウザ情報
         await oldest_account.save()
 
         # 他の重複アカウントを削除
@@ -282,6 +357,7 @@ async def TwitterTweetAPI(
     twitter_account: Annotated[TwitterAccount, Depends(GetCurrentTwitterAccount)],
     tweet: Annotated[str, Form(description='ツイートの本文 (基本的には140文字までだが、プレミアムの加入状態や英数字の量に依存する) 。')] = '',
     images: Annotated[list[UploadFile], File(description='ツイートに添付する画像 (4枚まで) 。')] = [],
+    in_reply_to_status_id: Annotated[str | None, Form(description='リプライ先のツイート ID (省略時は単独ツイート) 。')] = None,
 ):
     """
     Twitter にツイートを送信する。ツイート本文 or 画像のみ送信することもできる。<br>
@@ -298,51 +374,8 @@ async def TwitterTweetAPI(
             detail = 'Can tweet up to 4 images',
         )
 
-    # アップロードした画像の media_id のリスト
-    media_ids: list[str] = []
-
-    try:
-        # 画像をアップロードするタスク
-        # TODO: 本来はここもヘッドレスブラウザ経由で送信すべきだが、おそらく画像の受け渡しが面倒なのと、
-        # upload.x.com のみ他の API と異なり v1.1 時代からほぼそのままで Bot 対策も比較的緩そうなので当面これで行く…
-        logging.info(f'[TwitterRouter][TwitterTweetAPI] Uploading {len(images)} images...')
-        tweepy_api = twitter_account.getTweepyAPI()
-        image_upload_task: list[Coroutine[Any, Any, Any | None]] = []
-        for image in images:
-            image_upload_task.append(asyncio.to_thread(tweepy_api.media_upload,
-                filename = image.filename,
-                file = image.file,
-                # Twitter Web App の挙動に合わせて常にチャンク送信方式でアップロードする
-                chunked = True,
-                # Twitter Web App の挙動に合わせる
-                media_category = 'tweet_image',
-            ))
-
-        # 画像を Twitter にアップロード
-        ## asyncio.gather() で同時にアップロードし、ツイートをより早く送信できるように
-        ## ref: https://developer.twitter.com/ja/docs/media/upload-media/api-reference/post-media-upload-init
-        for image_upload_result in await asyncio.gather(*image_upload_task):
-            if image_upload_result is not None:
-                logging.info(f'[TwitterRouter][TwitterTweetAPI] Uploaded image. [media_id: {image_upload_result.media_id}]')
-                media_ids.append(str(image_upload_result.media_id))
-
-    # 画像のアップロードに失敗した
-    except tweepy.HTTPException as ex:
-        if len(ex.api_codes) > 0 and len(ex.api_messages) > 0:
-            # 定義されていないエラーコードの時は Twitter API から返ってきたエラーメッセージをそのまま返す
-            error_message = 'ツイート画像のアップロードに失敗しました。' + \
-                TwitterGraphQLAPI.ERROR_MESSAGES.get(ex.api_codes[0], f'Code: {ex.api_codes[0]} / Message: {ex.api_messages[0]}')
-        else:
-            error_message = f'ツイート画像のアップロード中に Twitter API から HTTP {ex.response.status_code} エラーが返されました。'
-            if len(ex.api_errors) > 0:
-                error_message += f'Message: {ex.api_errors[0]}'  # エラーメッセージがあれば追加
-        return schemas.TwitterAPIResult(
-            is_success = False,
-            detail = error_message,
-        )
-
-    # GraphQL API を使ってツイートを送信し、結果をそのまま返す
-    return await TwitterGraphQLAPI(twitter_account).createTweet(tweet, media_ids)
+    # Twitter Web App 経由でツイートを送信し、結果をそのまま返す
+    return await TwitterGraphQLAPI(twitter_account).createTweet(tweet, images, in_reply_to_status_id)
 
 
 @router.put(
@@ -434,6 +467,14 @@ async def TwitterFavoriteCancelAPI(
 async def TwitterTimelineAPI(
     twitter_account: Annotated[TwitterAccount, Depends(GetCurrentTwitterAccount)],
     cursor_id: Annotated[str | None, Query(description='前回のレスポンスから取得した、次のページを取得するためのカーソル ID 。')] = None,
+    cursor_type: Annotated[
+        Literal['Top', 'Bottom', 'Gap', 'ShowMore'],
+        Query(description='カーソル ID の種類。Top はより新しいツイート、Bottom / Gap / ShowMore は未取得範囲のツイート。'),
+    ] = 'Top',
+    seen_tweet_ids: Annotated[
+        str | None,
+        Query(description='Twitter Web App 上で閲覧済みとして扱われるツイート ID のカンマ区切りリスト。'),
+    ] = None,
 ):
     """
     ホームタイムラインを取得する。<br>
@@ -442,8 +483,16 @@ async def TwitterTimelineAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
     """
 
+    parsed_seen_tweet_ids = [
+        seen_tweet_id
+        for seen_tweet_id in (seen_tweet_ids.split(',') if seen_tweet_ids is not None else [])
+        if seen_tweet_id != ''
+    ]
+
     return await TwitterGraphQLAPI(twitter_account).homeLatestTimeline(
         cursor_id = cursor_id,
+        cursor_type = cursor_type,
+        seen_tweet_ids = parsed_seen_tweet_ids,
     )
 
 
@@ -458,6 +507,10 @@ async def TwitterSearchAPI(
     query: Annotated[str, Query(description='検索クエリ。')],
     search_type: Annotated[Literal['Top', 'Latest'], Query(description='検索タイプ。Top は話題のツイート、Latest は最新のツイート。')] = 'Latest',
     cursor_id: Annotated[str | None, Query(description='前回のレスポンスから取得した、次のページを取得するためのカーソル ID 。')] = None,
+    cursor_type: Annotated[
+        Literal['Top', 'Bottom', 'Gap', 'ShowMore'],
+        Query(description='カーソル ID の種類。Top はより新しいツイート、Bottom / Gap / ShowMore は未取得範囲のツイート。'),
+    ] = 'Top',
 ):
     """
     指定されたクエリでツイートを検索する。
@@ -469,4 +522,104 @@ async def TwitterSearchAPI(
         search_type = search_type,
         query = query,
         cursor_id = cursor_id,
+        cursor_type = cursor_type,
+    )
+
+
+@router.get(
+    '/video-proxy',
+    summary = 'Twitter 動画プロキシ API',
+    response_class = StreamingResponse,
+)
+async def TwitterVideoProxyAPI(
+    request: Request,
+    url: Annotated[str, Query(description='プロキシ対象の Twitter 動画 URL 。')],
+):
+    """
+    Twitter の動画を KonomiTV サーバー経由でプロキシ配信する。<br>
+    Twitter 側の仕様変更により、許可されたオリジン以外からの動画 URL への直接アクセスが<br>
+    403 Forbidden で拒否されるようになったため、サーバー側でリクエストを中継することでこの制限を回避する。<br>
+    Range リクエストに対応しており、動画のシーク操作が可能。<br>
+    セキュリティ上の理由から、`video.twimg.com` および `pbs.twimg.com` ドメインの HTTPS URL のみプロキシを許可する。
+    """
+
+    # Twitter 動画のプロキシで許可するドメインのリスト
+    ALLOWED_VIDEO_PROXY_DOMAINS = ['video.twimg.com', 'pbs.twimg.com']
+
+    # URL のバリデーション: スキームが https であること
+    parsed_url = urlparse(url)
+    if parsed_url.scheme != 'https':
+        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] URL scheme must be https: {parsed_url.scheme}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'URL scheme must be https.',
+        )
+
+    # URL のバリデーション: Twitter の動画ドメインのみ許可
+    if parsed_url.hostname not in ALLOWED_VIDEO_PROXY_DOMAINS:
+        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] URL domain is not allowed: {parsed_url.hostname}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = f'URL domain is not allowed. Only {", ".join(ALLOWED_VIDEO_PROXY_DOMAINS)} are allowed.',
+        )
+
+    # リクエストヘッダの構築
+    ## Range ヘッダを転送することで、動画のシーク操作に対応する
+    proxy_headers: dict[str, str] = {
+        'User-Agent': API_REQUEST_HEADERS['User-Agent'],
+    }
+    allowed_request_headers = ['range', 'accept', 'accept-encoding', 'if-range', 'if-none-match', 'if-modified-since']
+    for key, value in request.headers.items():
+        if key.lower() in allowed_request_headers:
+            proxy_headers[key] = value
+
+    # httpx クライアントを作成し、ストリーミングモードでリクエストを送信
+    ## メモリ効率のためにレスポンスボディを一括で読み込まず、チャンク単位でストリーミング転送する
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    try:
+        upstream_request = client.build_request('GET', url, headers=proxy_headers)
+        upstream_response = await client.send(upstream_request, stream=True)
+    except Exception as ex:
+        await client.aclose()
+        logging.error('[TwitterRouter][TwitterVideoProxyAPI] Failed to request upstream:', exc_info=ex)
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f'Failed to request upstream: {ex}',
+        )
+
+    # 上流サーバーからエラーレスポンスが返された場合はクリーンアップしてエラーを返す
+    if upstream_response.status_code >= 400:
+        error_body = await upstream_response.aread()
+        await upstream_response.aclose()
+        await client.aclose()
+        error_text = error_body[:200].decode('utf-8', errors='replace')
+        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] Upstream returned HTTP {upstream_response.status_code}: {error_text}')
+        raise HTTPException(
+            status_code = upstream_response.status_code,
+            detail = f'Upstream returned HTTP {upstream_response.status_code}.',
+        )
+
+    # レスポンスヘッダの構築
+    ## 動画のストリーミング再生に必要なヘッダを転送する
+    allowed_response_headers = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'cache-control',
+        'etag',
+        'last-modified',
+    ]
+    response_headers = {key: value for key, value in upstream_response.headers.items() if key.lower() in allowed_response_headers}
+
+    # ストリーミングレスポンスの完了後にクリーンアップを行う BackgroundTask
+    async def cleanup() -> None:
+        await upstream_response.aclose()
+        await client.aclose()
+
+    return StreamingResponse(
+        upstream_response.aiter_bytes(chunk_size=65536),
+        status_code = upstream_response.status_code,
+        headers = response_headers,
+        background = BackgroundTask(cleanup),
     )

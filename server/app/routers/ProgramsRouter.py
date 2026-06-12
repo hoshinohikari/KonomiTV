@@ -2,7 +2,6 @@
 import json
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal, cast
-from zoneinfo import ZoneInfo
 
 import ariblib.constants
 from fastapi import APIRouter, Body, Depends, Query
@@ -11,8 +10,11 @@ from tortoise import connections
 
 from app import logging, schemas
 from app.config import Config
+from app.constants import JST
+from app.models.Channel import Channel
 from app.routers.ReservationConditionsRouter import EncodeEDCBSearchKeyInfo
 from app.routers.ReservationsRouter import GetCtrlCmdUtil
+from app.utils import NormalizeToJSTDatetime, ParseDatetimeStringToJST
 from app.utils.edcb import EventInfo, ReserveDataRequired, SearchKeyInfo
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.edcb.EDCBUtil import EDCBUtil
@@ -72,7 +74,7 @@ def DecodeEDCBEventInfo(event_info: EventInfo) -> schemas.Program:
 
     # 番組開始時刻
     ## 万が一取得できなかった場合は 1970/1/1 9:00 とする
-    start_time = event_info.get('start_time', datetime(1970, 1, 1, 9, tzinfo=ZoneInfo('Asia/Tokyo')))
+    start_time = NormalizeToJSTDatetime(event_info.get('start_time', datetime(1970, 1, 1, 9, tzinfo=JST)))
 
     # 番組終了時刻
     ## 終了時間未定の場合、とりあえず5分とする
@@ -208,7 +210,7 @@ async def ProgramSearchAPI(
     """
 
     # schemas.ProgramSearchCondition オブジェクトを SearchKeyInfo オブジェクトに変換
-    search_key_info = await EncodeEDCBSearchKeyInfo(program_search_condition)
+    search_key_info = await EncodeEDCBSearchKeyInfo(program_search_condition, edcb)
 
     # EDCB の EPG ストアに保存されているすべての番組情報を検索
     ## 過去番組は検索対象外
@@ -217,8 +219,57 @@ async def ProgramSearchAPI(
         # None が返ってきた場合は空のリストを返す
         return schemas.Programs(total=0, programs=[])
 
-    # EDCB の EventInfo オブジェクトを schemas.Program オブジェクトに変換
-    programs = [DecodeEDCBEventInfo(event_info) for event_info in event_info_list]
+    # KonomiTV で管理対象の視聴可能チャンネルだけを検索結果として返す
+    ## EDCB の検索結果はワンセグや KonomiTV では除外しているチャンネル
+    ## (Ch: 042 などの基本イベント共有しかしてないサブチャンネルを含む) も返しうるが、
+    ## クライアント側で整合性を合わせるのが困難になるため、API 側で事前に除外してから返す
+    channel_rows = await Channel.filter(is_watchable=True).values(
+        'id',
+        'network_id',
+        'transport_stream_id',
+        'service_id',
+    )
+    channel_ids_by_service_triplet = {
+        (
+            channel_row['network_id'],
+            channel_row['transport_stream_id'],
+            channel_row['service_id'],
+        ): channel_row['id']
+        for channel_row in channel_rows
+        if channel_row['transport_stream_id'] is not None
+    }
+
+    # EDCB は検索タイミングや EPG 更新状態によって終了済み番組を返すことがあるため、放送開始前・放送中番組に絞る
+    now = datetime.now(JST)
+    programs: list[schemas.Program] = []
+    for event_info in event_info_list:
+        service_key = (event_info['onid'], event_info['tsid'], event_info['sid'])
+        channel_id = channel_ids_by_service_triplet.get(service_key)
+
+        # DB に存在しないサービスは、KonomiTV 上でロゴ表示や予約追加の対象にできないので検索結果から除外する
+        if channel_id is None:
+            continue
+
+        # イベント共有で別サービス側が主番組を指している場合は、Program.updateFromEDCB() と同じく副側を除外する
+        group_info = event_info.get('event_group_info')
+        if group_info is not None and len(group_info['event_data_list']) == 1:
+            primary_event = group_info['event_data_list'][0]
+            is_shared_event_side = (
+                primary_event['onid'] != event_info['onid'] or
+                primary_event['tsid'] != event_info['tsid'] or
+                primary_event['sid'] != event_info['sid'] or
+                primary_event['eid'] != event_info['eid']
+            )
+            if is_shared_event_side is True:
+                continue
+
+        program = DecodeEDCBEventInfo(event_info)
+        if program.end_time <= now:
+            continue
+
+        # DB 上のチャンネル ID を使い、KonomiTV のチャンネル一覧・ロゴ・予約表示の参照先を一致させる
+        program.channel_id = channel_id
+        programs.append(program)
 
     return schemas.Programs(total=len(programs), programs=programs)
 
@@ -242,15 +293,14 @@ async def TimeTableAPI(
     """
 
     # 現在時刻
-    now = datetime.now(ZoneInfo('Asia/Tokyo'))
+    now = datetime.now(JST)
 
     # 開始時刻のデフォルト値: 現在時刻
     if start_time is None:
         start_time = now
 
     # タイムゾーンが指定されていない場合は JST として扱う
-    if start_time.tzinfo is None:
-        start_time = start_time.replace(tzinfo=ZoneInfo('Asia/Tokyo'))
+    start_time = NormalizeToJSTDatetime(start_time)
 
     # データベースの生のコネクションを取得
     connection = connections.get('default')
@@ -264,16 +314,12 @@ async def TimeTableAPI(
 
     # 日付文字列を datetime に変換 (SQLite は文字列で保存されている)
     if earliest_str:
-        earliest = datetime.fromisoformat(earliest_str.replace(' ', 'T'))
-        if earliest.tzinfo is None:
-            earliest = earliest.replace(tzinfo=ZoneInfo('Asia/Tokyo'))
+        earliest = ParseDatetimeStringToJST(earliest_str)
     else:
         earliest = now
 
     if latest_str:
-        latest = datetime.fromisoformat(latest_str.replace(' ', 'T'))
-        if latest.tzinfo is None:
-            latest = latest.replace(tzinfo=ZoneInfo('Asia/Tokyo'))
+        latest = ParseDatetimeStringToJST(latest_str)
     else:
         latest = now + timedelta(days=7)
 
@@ -282,8 +328,7 @@ async def TimeTableAPI(
         end_time = latest
 
     # タイムゾーンが指定されていない場合は JST として扱う
-    if end_time.tzinfo is None:
-        end_time = end_time.replace(tzinfo=ZoneInfo('Asia/Tokyo'))
+    end_time = NormalizeToJSTDatetime(end_time)
 
     # チャンネル ID リストをパース
     target_channel_ids: list[str] | None = None
@@ -432,17 +477,33 @@ async def TimeTableAPI(
 
     # EDCB バックエンドの場合は予約情報を取得
     reservations_by_program_id: dict[str, dict[str, Any]] = {}
+    reservations_by_channel_time: dict[str, list[dict[str, Any]]] = {}
     if Config().general.backend == 'EDCB':
         try:
             edcb = CtrlCmdUtil()
             reserve_data_list: list[ReserveDataRequired] | None = await edcb.sendEnumReserve()
             if reserve_data_list is not None:
+                # (ONID, TSID, SID) からチャンネル ID への逆引き辞書
+                ## 予約の EID が DB 上の番組情報と不一致でも、同一チャンネルかつ同一時間帯なら予約情報を表示できるようにする
+                channel_id_by_service_triplet: dict[tuple[int, int, int], str] = {}
+                for channel_row in channels_result:
+                    if channel_row['transport_stream_id'] is None:
+                        continue
+                    channel_id_by_service_triplet[(
+                        channel_row['network_id'],
+                        channel_row['transport_stream_id'],
+                        channel_row['service_id'],
+                    )] = channel_row['id']
+
                 # 録画中判定を行う時間範囲 (現在時刻の2時間前〜2時間後)
                 # 番組延長や繰り上げを考慮して余裕を持たせる
                 recording_check_start = now - timedelta(hours=2)
                 recording_check_end = now + timedelta(hours=2)
 
                 for reserve_data in reserve_data_list:
+                    reserve_start_time = NormalizeToJSTDatetime(reserve_data['start_time'])
+                    reserve_end_time = reserve_start_time + timedelta(seconds=reserve_data['duration_second'])
+
                     # 番組 ID を構築
                     program_id = f'NID{reserve_data["onid"]}-SID{reserve_data["sid"]:03d}-EID{reserve_data["eid"]}'
 
@@ -452,14 +513,10 @@ async def TimeTableAPI(
                     if rec_mode >= 5:  # 5以上は無効
                         status = 'Disabled'
                     else:
-                        # 予約の開始・終了時刻を計算
-                        reserve_start = reserve_data['start_time']
-                        reserve_end = reserve_start + timedelta(seconds=reserve_data['duration_second'])
-
                         # 現在時刻付近の番組のみ録画中かどうかを判定 (N+1 問題の回避)
                         # 明らかに録画中でない番組に対して EDCB にクエリを発行しても無駄なので、
                         # 録画中判定の時間範囲内 (現在時刻の前後2時間) にある番組のみチェックする
-                        if reserve_start <= recording_check_end and reserve_end >= recording_check_start:
+                        if reserve_start_time <= recording_check_end and reserve_end_time >= recording_check_start:
                             is_recording = type(await edcb.sendGetRecFilePath(reserve_data['reserve_id'])) is str
                             status = 'Recording' if is_recording else 'Reserved'
                         else:
@@ -477,9 +534,22 @@ async def TimeTableAPI(
                         'status': status,
                         'recording_availability': recording_availability,
                     }
+                    channel_id = channel_id_by_service_triplet.get((
+                        reserve_data['onid'],
+                        reserve_data['tsid'],
+                        reserve_data['sid'],
+                    ))
+                    if channel_id is not None:
+                        if channel_id not in reservations_by_channel_time:
+                            reservations_by_channel_time[channel_id] = []
+                        reservations_by_channel_time[channel_id].append({
+                            'start_time': reserve_start_time,
+                            'end_time': reserve_end_time,
+                            'reservation': reservations_by_program_id[program_id],
+                        })
         except Exception as ex:
             # 予約情報の取得に失敗しても番組表自体は返す
-            logging.warning(f'[ProgramsRouter][TimeTableAPI] Failed to get reservations: {ex}')
+            logging.warning('[ProgramsRouter][TimeTableAPI] Failed to get reservations:', exc_info=ex)
 
     # チャンネルごとに番組をグループ化
     programs_by_channel: dict[str, list[dict[str, Any]]] = {c['id']: [] for c in channels_result}
@@ -490,9 +560,12 @@ async def TimeTableAPI(
             program_row['detail'] = json.loads(program_row['detail']) if program_row['detail'] else {}
             program_row['genres'] = json.loads(program_row['genres']) if program_row['genres'] else []
 
-            # 日時文字列を ISO8601 形式に変換
-            program_row['start_time'] = program_row['start_time'].replace(' ', 'T')
-            program_row['end_time'] = program_row['end_time'].replace(' ', 'T')
+            # SQLite から取得した番組開始・終了時刻を JST aware datetime に正規化する
+            ## DB には基本的に UTC+9 を保存しているが、将来のデータ混在に備えてタイムゾーンなしでも JST を補う
+            program_start_time = ParseDatetimeStringToJST(program_row['start_time'])
+            program_end_time = ParseDatetimeStringToJST(program_row['end_time'])
+            program_row['start_time'] = program_start_time.isoformat()
+            program_row['end_time'] = program_end_time.isoformat()
 
             # 真偽値を変換 (SQLite では 0/1)
             program_row['is_free'] = bool(program_row['is_free'])
@@ -502,7 +575,26 @@ async def TimeTableAPI(
             if program_id in reservations_by_program_id:
                 program_row['reservation'] = reservations_by_program_id[program_id]
             else:
-                program_row['reservation'] = None
+                # 予約の EID が一致しない場合でも、同一チャンネルかつ同一時間帯で重なる予約があれば暫定的に紐付ける
+                ## スポーツ中継の延長などで EIT[p/f] と EIT[schedule] が一時的にずれるケースを救済する
+                fallback_reservation = None
+                fallback_reservations = reservations_by_channel_time.get(channel_id, [])
+                if fallback_reservations:
+                    best_overlap_seconds = 0
+                    best_overlap_index = -1
+                    for index, fallback in enumerate(fallback_reservations):
+                        overlap_start_time = max(program_start_time, fallback['start_time'])
+                        overlap_end_time = min(program_end_time, fallback['end_time'])
+                        overlap_seconds = (overlap_end_time - overlap_start_time).total_seconds()
+                        if overlap_seconds > best_overlap_seconds:
+                            best_overlap_seconds = overlap_seconds
+                            best_overlap_index = index
+
+                    if best_overlap_index >= 0:
+                        # pop() で採用済み要素をリストから除外し、以降の番組に同一予約が二重割当されることを防ぐ
+                        fallback_reservation = fallback_reservations.pop(best_overlap_index)['reservation']
+
+                program_row['reservation'] = fallback_reservation
 
             programs_by_channel[channel_id].append(program_row)
 
