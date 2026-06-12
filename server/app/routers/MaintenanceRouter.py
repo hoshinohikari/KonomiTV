@@ -341,10 +341,17 @@ def ServerRestartAPI(
                 target_process = parent_process
 
         # 現在の Uvicorn サーバーを終了する
-        if sys.platform == 'win32':
-            target_process.send_signal(signal.CTRL_C_EVENT)
-        else:
-            target_process.send_signal(signal.SIGINT)
+        try:
+            # Windows サービス環境ではコンソールが存在しないため、CTRL_C_EVENT が配送されないことがある
+            ## Graceful に終了できない場合に備えて terminate() をフォールバックとして呼び出す
+            if sys.platform == 'win32':
+                target_process.send_signal(signal.CTRL_C_EVENT)
+            else:
+                target_process.send_signal(signal.SIGINT)
+        except (ProcessLookupError, PermissionError) as ex:
+            logging.warning('[MaintenanceRouter][ServerRestartAPI] Failed to send graceful shutdown signal; '
+                            'falling back to terminate().', exc_info=ex)
+            target_process.terminate()
 
         # Uvicorn 終了後に再起動が必要であることを示すロックファイルを作成する
         # Uvicorn 終了後、KonomiTV.py でロックファイルの存在が確認され、もし存在していればサーバー再起動が行われる
@@ -379,10 +386,17 @@ def ServerShutdownAPI(
                 target_process = parent_process
 
         # 現在の Uvicorn サーバーを終了する
-        if sys.platform == 'win32':
-            target_process.send_signal(signal.CTRL_C_EVENT)
-        else:
-            target_process.send_signal(signal.SIGINT)
+        try:
+            # Windows サービス環境ではコンソールが存在しないため、CTRL_C_EVENT が配送されないことがある
+            ## Graceful に終了できない場合に備えて terminate() をフォールバックとして呼び出す
+            if sys.platform == 'win32':
+                target_process.send_signal(signal.CTRL_C_EVENT)
+            else:
+                target_process.send_signal(signal.SIGINT)
+        except (ProcessLookupError, PermissionError) as ex:
+            logging.warning('[MaintenanceRouter][ServerShutdownAPI] Failed to send graceful shutdown signal; '
+                            'falling back to terminate().', exc_info=ex)
+            target_process.terminate()
 
     # バックグラウンドでサーバー終了を開始
     threading.Thread(target=Shutdown).start()
