@@ -4,6 +4,8 @@ import concurrent.futures
 import platform
 import sys
 from collections.abc import Callable
+
+import psutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -220,6 +222,55 @@ async def ShutdownProcessPoolExecutor(
 
     # キャンセル時の強制終了処理はプロセス状態確認や join() を含むため、必ず別スレッドで実行する
     await asyncio.to_thread(TerminateAndShutdownExecutor)
+
+
+def TerminateSubprocessTree(process: asyncio.subprocess.Process | None) -> None:
+    """
+    asyncio サブプロセスとその子プロセスをまとめて強制終了する
+
+    create_subprocess_shell() で起動した `ffmpeg | HWEncC` のようなパイプラインでは、
+    親プロセス (shell) に対する kill() だけでは FFmpeg / HWEncC などの子プロセスが残ることがある。
+    psutil でプロセスツリーごと終了させることで、エンコーダー関連の子プロセス取り残しを防ぐ。
+
+    Args:
+        process (asyncio.subprocess.Process | None): 終了させるサブプロセス
+    """
+
+    if process is None or process.returncode is not None:
+        return
+
+    pid = process.pid
+    if pid is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        return
+
+    try:
+        root_process = psutil.Process(pid)
+        if root_process.is_running() is not True:
+            return
+        # 子から順に kill し、親だけ先に落として子が孤児化する可能性を下げる
+        target_processes = root_process.children(recursive=True)
+        target_processes.append(root_process)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error:
+        # psutil で列挙できない場合は、少なくとも asyncio 側が保持している親プロセスだけ終了させる
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        return
+
+    for target_process in reversed(target_processes):
+        try:
+            target_process.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            continue
 
 
 def Interlaced(n: int):

@@ -30,7 +30,7 @@ from app.constants import (
 )
 from app.models.Channel import Channel
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
-from app.utils import GetMirakurunAPIEndpointURL
+from app.utils import GetMirakurunAPIEndpointURL, TerminateSubprocessTree
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.edcb.PipeStreamReader import PipeStreamReader
 
@@ -902,7 +902,7 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
-                        encoder.kill()
+                        TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
 
@@ -952,7 +952,7 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
-                        encoder.kill()
+                        TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
 
@@ -987,7 +987,7 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
-                        encoder.kill()
+                        TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
 
@@ -1555,7 +1555,7 @@ class LiveEncodingTask:
         ## 何らかの理由で既に終了している場合は何もしない
         try:
             tsreadex.kill()
-            encoder.kill()
+            TerminateSubprocessTree(encoder)
         except Exception:
             pass
 

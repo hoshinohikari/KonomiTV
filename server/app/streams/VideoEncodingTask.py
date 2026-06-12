@@ -26,6 +26,7 @@ from app import logging
 from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.schemas import KeyFrame
+from app.utils import TerminateSubprocessTree
 from app.utils.TSKeyFrameSeeker import TSKeyFrameCollector
 
 
@@ -1295,7 +1296,7 @@ class VideoEncodingTask:
                 if self._encoder_process is not None:
                     try:
                         if self._encoder_process.returncode is None:
-                            self._encoder_process.kill()
+                            TerminateSubprocessTree(self._encoder_process)
                             try:
                                 # プロセスの終了を待機
                                 await asyncio.wait_for(self._encoder_process.wait(), timeout=5.0)
@@ -1431,7 +1432,7 @@ class VideoEncodingTask:
             if self._encoder_process is not None:
                 try:
                     if self._encoder_process.returncode is None:
-                        self._encoder_process.kill()
+                        TerminateSubprocessTree(self._encoder_process)
                         try:
                             await asyncio.wait_for(self._encoder_process.wait(), timeout=5.0)
                             logging.debug(f'{self.video_stream.log_prefix} Encoder process terminated cleanly in final cleanup.')
@@ -1557,7 +1558,7 @@ class VideoEncodingTask:
             if self._encoder_process is not None:
                 try:
                     if self._encoder_process.returncode is None:
-                        self._encoder_process.kill()
+                        TerminateSubprocessTree(self._encoder_process)
                         logging.debug(f'{self.video_stream.log_prefix} Encoder process kill signal sent (cancel).')
                 except Exception as ex:
                     logging.error(f'{self.video_stream.log_prefix} Failed to terminate encoder process:', exc_info=ex)
