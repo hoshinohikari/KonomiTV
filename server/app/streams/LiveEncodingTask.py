@@ -900,8 +900,16 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
+                    # tsreadex とエンコーダーは別々の try で終了する
+                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
+                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
+                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
+                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -950,8 +958,16 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
+                    # tsreadex とエンコーダーは別々の try で終了する
+                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
+                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
+                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
+                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -985,8 +1001,16 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
+                    # tsreadex とエンコーダーは別々の try で終了する
+                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
+                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
+                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
+                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -1553,8 +1577,16 @@ class LiveEncodingTask:
 
         # 明示的にエンコーダープロセスを終了する
         ## 何らかの理由で既に終了している場合は何もしない
+        # tsreadex とエンコーダーは別々の try で終了する
+        ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
+        ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
         try:
             tsreadex.kill()
+        except Exception:
+            pass
+        try:
+            # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
+            # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
             TerminateSubprocessTree(encoder)
         except Exception:
             pass
