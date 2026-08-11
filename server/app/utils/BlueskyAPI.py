@@ -6,7 +6,7 @@ import io
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any, ClassVar, Final, TypeVar, cast
+from typing import Any, ClassVar, Final, TypeVar, cast, get_args
 
 from atproto import (
     AsyncClient,
@@ -26,6 +26,7 @@ from atproto_client.request import Response
 from fastapi import HTTPException, UploadFile
 from httpx import Timeout
 from PIL import Image
+from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 from app import logging, schemas
@@ -34,98 +35,136 @@ from app.models.BlueskyAccount import BlueskyAccount
 
 
 _RetriableResultT = TypeVar('_RetriableResultT')
-_ATPROTO_SUPPORTED_VIEW_EMBED_TYPES: Final[set[str]] = {
-    'app.bsky.embed.images#view',
-    'app.bsky.embed.video#view',
-    'app.bsky.embed.external#view',
-    'app.bsky.embed.record#view',
-    'app.bsky.embed.recordWithMedia#view',
-}
-_ATPROTO_SUPPORTED_FEED_REASON_TYPES: Final[set[str]] = {
-    'app.bsky.feed.defs#reasonRepost',
-    'app.bsky.feed.defs#reasonPin',
-}
 
 
-def _NormalizeUnsupportedEmbedForSDK(embed: dict[str, Any]) -> None:
+def _CollectSDKUnionTypeTags(annotation: Any) -> set[str]:
     """
-    SDK 未対応の Bluesky embed を既存モデルで読める形へ正規化する
+    atproto SDK の Pydantic Union 型から discriminator 用の $type を収集する
+
+    Args:
+        annotation (Any): Pydantic モデルフィールドの型注釈
+
+    Returns:
+        set[str]: SDK が現在受け入れられる $type の集合
+    """
+
+    supported_type_tags: set[str] = set()
+
+    # atproto SDK は Lexicon の $type を py_type フィールドの default として保持している
+    ## 依存バージョンは固定しているため、この構造を SDK 側の信頼できる型定義として扱う
+    if isinstance(annotation, type) is True and issubclass(annotation, BaseModel) is True:
+        py_type_field = annotation.model_fields.get('py_type')
+        if py_type_field is not None and isinstance(py_type_field.default, str) is True:
+            supported_type_tags.add(py_type_field.default)
+        return supported_type_tags
+
+    # Optional / Annotated / Union の入れ子を再帰的に辿り、実際の Pydantic モデルだけを拾う
+    for child_annotation in get_args(annotation):
+        supported_type_tags.update(_CollectSDKUnionTypeTags(child_annotation))
+
+    return supported_type_tags
+
+
+def _CollectRequiredSDKUnionTypeTags(field_name: str, annotation: Any) -> set[str]:
+    """
+    固定した atproto SDK から必須 Union タグを収集する
+
+    Args:
+        field_name (str): 起動時エラーに含める SDK フィールド名
+        annotation (Any): Pydantic モデルフィールドの型注釈
+
+    Returns:
+        set[str]: SDK が現在受け入れられる $type の集合
+    """
+
+    supported_type_tags = _CollectSDKUnionTypeTags(annotation)
+
+    # 依存バージョンを固定しているため、ここで空になる場合は SDK の型構造を読めていない
+    ## そのまま起動すると既知 embed まで未知扱いになるため、原因が分かる形で起動時に止める
+    if len(supported_type_tags) == 0:
+        raise RuntimeError(f'Failed to collect atproto SDK union type tags. field: {field_name}')
+
+    return supported_type_tags
+
+
+_ATPROTO_SUPPORTED_MAIN_EMBED_TYPES: Final[set[str]] = _CollectRequiredSDKUnionTypeTags(
+    'AppBskyFeedPost.Record.embed',
+    models.AppBskyFeedPost.Record.model_fields['embed'].annotation,
+)
+_ATPROTO_SUPPORTED_VIEW_EMBED_TYPES: Final[set[str]] = _CollectRequiredSDKUnionTypeTags(
+    'AppBskyFeedDefs.PostView.embed',
+    models.AppBskyFeedDefs.PostView.model_fields['embed'].annotation,
+)
+_ATPROTO_SUPPORTED_FEED_REASON_TYPES: Final[set[str]] = _CollectRequiredSDKUnionTypeTags(
+    'AppBskyFeedDefs.FeedViewPost.reason',
+    models.AppBskyFeedDefs.FeedViewPost.model_fields['reason'].annotation,
+)
+
+
+def _NormalizeUnknownEmbedForSDK(embed: dict[str, Any], *, is_view_embed: bool | None = None) -> None:
+    """
+    SDK 未対応の Bluesky embed だけをメディアなし embed へ正規化する
 
     Args:
         embed (dict[str, Any]): raw レスポンス上の embed オブジェクト
+        is_view_embed (bool | None): view 側 embed として扱うかどうか (None なら $type から推定)
     """
 
     embed_type = embed.get('$type')
+    if isinstance(embed_type, str) is False:
+        return
 
-    # recordWithMedia の media 側に gallery が入る場合も、同じ画像 embed として読ませる
-    if embed_type == 'app.bsky.embed.recordWithMedia#view':
+    # recordWithMedia は media 内に別の embed Union を持つため、外側を保ったまま内側だけを処理する
+    if embed_type in ('app.bsky.embed.recordWithMedia', 'app.bsky.embed.recordWithMedia#view'):
         media = embed.get('media')
         if isinstance(media, dict) is True:
-            _NormalizeUnsupportedEmbedForSDK(cast(dict[str, Any], media))
+            _NormalizeUnknownEmbedForSDK(
+                cast(dict[str, Any], media),
+                is_view_embed = embed_type.endswith('#view'),
+            )
         return
 
-    # Python SDK が gallery に対応するまで、画像一覧として表示できる thumbnail / fullsize だけを使う
-    if embed_type == 'app.bsky.embed.gallery#view':
-        items = embed.get('items')
-        if isinstance(items, list) is False:
-            embed.clear()
-            embed.update({'$type': 'app.bsky.embed.images#view', 'images': []})
-            return
-
-        images: list[dict[str, Any]] = []
-        for item_value in cast(list[Any], items):
-            if isinstance(item_value, dict) is False:
-                continue
-            item = cast(dict[str, Any], item_value)
-            thumbnail = item.get('thumbnail')
-            fullsize = item.get('fullsize') or thumbnail
-
-            # images#viewImage は thumb / fullsize が必須なので、URL がない項目は表示対象から外す
-            if isinstance(thumbnail, str) is False or isinstance(fullsize, str) is False:
-                continue
-
-            image: dict[str, Any] = {
-                '$type': 'app.bsky.embed.images#viewImage',
-                'alt': item.get('alt') if isinstance(item.get('alt'), str) is True else '',
-                'fullsize': fullsize,
-                'thumb': thumbnail,
-            }
-            aspect_ratio = item.get('aspectRatio')
-            if isinstance(aspect_ratio, dict) is True:
-                image['aspectRatio'] = aspect_ratio
-            images.append(image)
-
-        embed.clear()
-        embed.update({'$type': 'app.bsky.embed.images#view', 'images': images[:BlueskyAPI.MAX_IMAGE_COUNT]})
+    # SDK がすでに知っている型は、将来の追加フィールドを含んでいてもそのまま SDK に渡す
+    if embed_type in _ATPROTO_SUPPORTED_MAIN_EMBED_TYPES or embed_type in _ATPROTO_SUPPORTED_VIEW_EMBED_TYPES:
         return
 
-    # SDK が知らない embed は投稿本文まで巻き込んで落ちるため、メディアなし投稿として扱う
-    if isinstance(embed_type, str) is True and embed_type not in _ATPROTO_SUPPORTED_VIEW_EMBED_TYPES:
-        embed.clear()
+    unsupported_embed_type = cast(str, embed_type)
+    should_treat_as_view_embed = is_view_embed if is_view_embed is not None else unsupported_embed_type.endswith('#view')
+
+    # 未知 embed は投稿本文まで巻き込んで落ちるため、既知の空画像 embed として扱う
+    ## 本文・投稿者・リアクション数は残し、KonomiTV が解釈できないメディアだけを捨てる
+    embed.clear()
+    if should_treat_as_view_embed is True:
         embed.update({'$type': 'app.bsky.embed.images#view', 'images': []})
+    else:
+        embed.update({'$type': 'app.bsky.embed.images', 'images': []})
 
 
-def _NormalizeUnsupportedEmbedsForSDK(value: Any) -> None:
+def _NormalizeUnknownSchemaForSDK(value: Any) -> None:
     """
-    API レスポンス内の SDK 未対応 embed / reason を再帰的に正規化する
+    API レスポンス内の SDK 未対応 Union 要素を再帰的に正規化する
 
     Args:
         value (Any): API レスポンス内の任意の値
     """
 
-    # Bluesky 側の未知フィールドはそのまま残し、SDK の Union 判定で落ちる既知フィールドだけを読み替える
+    # SDK が closed union で落ちる既知フィールドだけを触り、通常の拡張フィールドはそのまま残す
     if isinstance(value, dict) is True:
         value_dict = cast(dict[str, Any], value)
+
         embed = value_dict.get('embed')
         if isinstance(embed, dict) is True:
-            _NormalizeUnsupportedEmbedForSDK(cast(dict[str, Any], embed))
+            _NormalizeUnknownEmbedForSDK(
+                cast(dict[str, Any], embed),
+                is_view_embed = value_dict.get('$type') != 'app.bsky.feed.post',
+            )
 
-        # quoted post の ViewRecord.embeds は embed オブジェクト自体の配列なので、配列直下の要素も先に読み替える
+        # quoted post の ViewRecord.embeds は view 側 embed の配列なので、未知要素だけをメディアなしにする
         embeds = value_dict.get('embeds')
         if isinstance(embeds, list) is True:
             for embed_value in cast(list[Any], embeds):
                 if isinstance(embed_value, dict) is True:
-                    _NormalizeUnsupportedEmbedForSDK(cast(dict[str, Any], embed_value))
+                    _NormalizeUnknownEmbedForSDK(cast(dict[str, Any], embed_value), is_view_embed = True)
 
         # 未知の reason は表示理由が分からないだけなので、投稿自体を残すために理由なしとして扱う
         reason = value_dict.get('reason')
@@ -135,26 +174,26 @@ def _NormalizeUnsupportedEmbedsForSDK(value: Any) -> None:
                 value_dict.pop('reason')
 
         for child_value in value_dict.values():
-            _NormalizeUnsupportedEmbedsForSDK(child_value)
+            _NormalizeUnknownSchemaForSDK(child_value)
         return
 
     if isinstance(value, list) is True:
         for child_value in cast(list[Any], value):
-            _NormalizeUnsupportedEmbedsForSDK(child_value)
+            _NormalizeUnknownSchemaForSDK(child_value)
 
 
-def _PatchAtprotoGalleryEmbedResponseModel() -> None:
+def _PatchAtprotoUnknownSchemaResponseModel() -> None:
     """
-    atproto SDK のレスポンスモデル化直前に未対応 embed を正規化する
+    atproto SDK のレスポンスモデル化直前に未対応 Union 要素だけを読み飛ばす
     """
 
     original_get_response_model = async_ns.get_response_model
-    if getattr(original_get_response_model, '_konomitv_gallery_embed_patch', False) is True:
+    if getattr(original_get_response_model, '_konomitv_unknown_schema_patch', False) is True:
         return
 
-    def GetResponseModelWithGalleryEmbedPatch(response: Response, model: type[Any]) -> Any:
+    def GetResponseModelWithUnknownSchemaPatch(response: Response, model: type[Any]) -> Any:
         """
-        未対応 embed を SDK 既知の画像 embed へ寄せてからレスポンスモデルへ変換する
+        未対応 Union 要素をメディアなし・理由なしへ変換してからレスポンスモデルへ変換する
 
         Args:
             response (Response): atproto SDK の raw レスポンス
@@ -164,11 +203,11 @@ def _PatchAtprotoGalleryEmbedResponseModel() -> None:
             Any: SDK が返すレスポンスモデル
         """
 
-        _NormalizeUnsupportedEmbedsForSDK(response.content)
+        _NormalizeUnknownSchemaForSDK(response.content)
         return original_get_response_model(response, model)
 
-    setattr(GetResponseModelWithGalleryEmbedPatch, '_konomitv_gallery_embed_patch', True)
-    async_ns.get_response_model = GetResponseModelWithGalleryEmbedPatch
+    setattr(GetResponseModelWithUnknownSchemaPatch, '_konomitv_unknown_schema_patch', True)
+    async_ns.get_response_model = GetResponseModelWithUnknownSchemaPatch
 
 
 class BlueskyReplyReference(TypedDict):
@@ -606,6 +645,9 @@ class BlueskyAPI:
         embed = post.embed
         if isinstance(embed, models.AppBskyEmbedImages.View):
             image_urls = [image.thumb for image in embed.images]
+        elif isinstance(embed, models.AppBskyEmbedGallery.View):
+            # gallery embed は現行 Lexicon 上すべて画像項目なので、表示用サムネイル URL をそのまま拾う
+            image_urls = [item.thumbnail for item in embed.items]
 
         # 以降の UI は Twitter と同じ TweetUser を参照するため、DID と handle を共通フィールドへ詰め替える
         tweet_user = schemas.TweetUser(
@@ -1124,5 +1166,5 @@ class BlueskyAPI:
         return expanded_text_bytes.decode('utf-8')
 
 
-# atproto SDK が gallery embed に対応するまで、レスポンスモデル化直前の読み替えだけを追加する
-_PatchAtprotoGalleryEmbedResponseModel()
+# atproto SDK が将来の表示系 Union 追加で落ちる場合も、投稿本文だけは残せるようにする
+_PatchAtprotoUnknownSchemaResponseModel()
