@@ -1234,7 +1234,7 @@ class RecordedScanTask:
 
                 # サムネイル移行完了後、関連する RecordedVideo の key_frames / cm_sections もチェックし、
                 # どちらかが未解析（None）の場合は後台分析タスクを起動する
-                db_recorded_video_after_thumbnail = await RecordedVideo.get_or_none(id=video_row['id']).select_related('recorded_program', 'recorded_program__channel')
+                db_recorded_video_after_thumbnail = await RecordedVideo.get_or_none(id=video_row['id']).select_related('recorded_program', 'recorded_program__channel', 'recorded_program__recorded_video')
                 if db_recorded_video_after_thumbnail is not None:
                     needs_background_analysis = (
                         db_recorded_video_after_thumbnail.key_frames is None or
