@@ -1234,15 +1234,19 @@ class RecordedScanTask:
 
                 # サムネイル移行完了後、関連する RecordedVideo の key_frames / cm_sections もチェックし、
                 # どちらかが未解析（None）の場合は後台分析タスクを起動する
-                db_recorded_video_after_thumbnail = await RecordedVideo.get_or_none(id=video_row['id']).select_related('recorded_program', 'recorded_program__channel', 'recorded_program__recorded_video')
-                if db_recorded_video_after_thumbnail is not None:
+                # RecordedVideo 側から select_related('recorded_program__recorded_video') を張ると同一テーブルの自己結合になり、
+                # SQLite で "ambiguous column name" エラーが発生するため、RecordedProgram 側から recorded_video / channel をまとめて取得する
+                recorded_program_after_thumbnail = await RecordedProgram.get_or_none(
+                    id=video_row['recorded_program_id'],
+                ).select_related('recorded_video', 'channel')
+                if recorded_program_after_thumbnail is not None and recorded_program_after_thumbnail.recorded_video is not None:
                     needs_background_analysis = (
-                        db_recorded_video_after_thumbnail.key_frames is None or
-                        db_recorded_video_after_thumbnail.cm_sections is None
+                        recorded_program_after_thumbnail.recorded_video.key_frames is None or
+                        recorded_program_after_thumbnail.recorded_video.cm_sections is None
                     )
                     if needs_background_analysis:
                         logging.info(f'{file_path}: Missing keyframes or CM sections. Starting background analysis. ({index}/{len(target_video_rows)})')
-                        recorded_program_for_bg = schemas.RecordedProgram.model_validate(db_recorded_video_after_thumbnail.recorded_program, from_attributes=True)
+                        recorded_program_for_bg = schemas.RecordedProgram.model_validate(recorded_program_after_thumbnail, from_attributes=True)
                         # 後台分析を非同期タスクとして起動（ブロッキングを避けるため await しない）
                         task = asyncio.create_task(self.__runBackgroundAnalysis(recorded_program_for_bg))
                         self._background_tasks[file_path] = task
