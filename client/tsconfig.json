@@ -30,6 +30,7 @@
             "WebWorker",
         ],
         "types": [
+            "node",  // assert や events などの Node.js API の型定義
             "network-information-types",
             "offscreencanvas",
             "resize-observer-browser",
