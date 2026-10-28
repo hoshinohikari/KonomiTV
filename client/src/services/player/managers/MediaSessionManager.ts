@@ -176,6 +176,10 @@ class MediaSessionManager implements PlayerManager {
         if ('setPositionState' in navigator.mediaSession) {
             // ビデオ視聴のみ
             if (this.playback_mode === 'Video') {
+                // 原画への画質切り替え直後は動画長が未確定なので、メタデータ取得後の通知で更新する。
+                if (Number.isNaN(this.player.video.duration) === true) {
+                    return;
+                }
                 navigator.mediaSession.setPositionState({
                     // 現在の動画の長さ
                     duration: this.player.video.duration,

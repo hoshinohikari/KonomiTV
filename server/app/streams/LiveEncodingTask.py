@@ -7,6 +7,7 @@ import asyncio
 import gc
 import os
 import re
+import sys
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -61,6 +62,11 @@ class LiveEncodingTask:
     # VCEEncC 利用時のみ起動時に OpenCL シェーダーがコンパイルされる関係で起動が遅いため、10 秒に設定
     ENCODER_TS_READ_TIMEOUT_ONAIR: ClassVar[int] = 5
     ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC: ClassVar[int] = 10
+
+    # オリジナル画質で ONAir に移行するために必要な、ライブストリームへ書き込んだ TS データの累積バイト数
+    ## 地上波・BS 放送の TS ビットレート (おおよそ 16〜19Mbps) を前提に、約 0.75 秒分のデータ量 (1.5MiB) とする
+    ## tsreadex から最初の TS パケットが出た直後だと再生に足りないため、実際に再生可能な量が溜まってから ONAir にする
+    ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES: ClassVar[int] = int(1.5 * 1024 * 1024)
 
 
     def __init__(self, live_stream: LiveStream) -> None:
@@ -156,57 +162,53 @@ class LiveEncodingTask:
         options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
-        # 新規: 'source' 品質は映像をそのままコピーして出力（再エンコード・フィルタなし）
-        if quality == 'source':
-            options.append('-vcodec copy')
+        ## コーデック
+        if QUALITY[quality].is_hevc is True:
+            options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
         else:
-            ## コーデック
-            if QUALITY[quality].is_hevc is True:
-                options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
-            else:
-                options.append('-vcodec libx264')  # H.264
+            options.append('-vcodec libx264')  # H.264
 
-            ## ビットレートと品質
-            options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-            options.append('-preset veryfast -aspect 16:9')
-            if QUALITY[quality].is_hevc is True:
-                options.append('-profile:v main')
-            else:
-                options.append('-profile:v high')
+        ## ビットレートと品質
+        options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
+        options.append('-preset veryfast -aspect 16:9')
+        if QUALITY[quality].is_hevc is True:
+            options.append('-profile:v main')
+        else:
+            options.append('-profile:v high')
 
-            ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
-            ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
-            video_width = QUALITY[quality].width
-            video_height = QUALITY[quality].height
-            if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
-                video_width = 1920
+        ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
+        ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
+        video_width = QUALITY[quality].width
+        video_height = QUALITY[quality].height
+        if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
+            video_width = 1920
 
-            ## 最大 GOP 長 (秒)
-            ## 30fps なら ×30 、 60fps なら ×60 された値が --gop-len で使われる
-            gop_length_second = self.GOP_LENGTH_SECONDS_H264
-            if QUALITY[quality].is_hevc is True:
-                ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
-                gop_length_second = self.GOP_LENGTH_SECONDS_H265
+        ## 最大 GOP 長 (秒)
+        ## 30fps なら ×30 、 60fps なら ×60 された値が --gop-len で使われる
+        gop_length_second = self.GOP_LENGTH_SECONDS_H264
+        if QUALITY[quality].is_hevc is True:
+            ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
+            gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
-            ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
-            if channel_type == "BS4K":
-                options.append(f'-vf scale={video_width}:{video_height}')
+        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
+        if channel_type == "BS4K":
+            options.append(f'-vf scale={video_width}:{video_height}')
+            options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
+        else:
+            ## インターレース解除 (60i → 60p (フレームレート: 60fps))
+            if QUALITY[quality].is_60fps is True:
+                options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
                 options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
+            ## インターレース解除 (60i → 30p (フレームレート: 30fps))
             else:
-                ## インターレース解除 (60i → 60p (フレームレート: 60fps))
-                if QUALITY[quality].is_60fps is True:
-                    options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
-                    options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
-                ## インターレース解除 (60i → 30p (フレームレート: 30fps))
+                # 24fps モードでは、テレシネ由来の重複フレームを取り除いて 24/30p 混合 VFR で出力する
+                ## dejudder を併用すると、24fps 区間の PTS が 41.7ms 間隔に均されて本来の 24fps に近い時刻列になる
+                if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
+                    options.append(f'-vf pullup,dejudder,scale={video_width}:{video_height}')
+                    options.append(f'-fps_mode vfr -g {int(gop_length_second * 30)}')
                 else:
-                    # 24fps モードでは、テレシネ由来の重複フレームを取り除いて 24/30p 混合 VFR で出力する
-                    ## dejudder を併用すると、24fps 区間の PTS が 41.7ms 間隔に均されて本来の 24fps に近い時刻列になる
-                    if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
-                        options.append(f'-vf pullup,dejudder,scale={video_width}:{video_height}')
-                        options.append(f'-fps_mode vfr -g {int(gop_length_second * 30)}')
-                    else:
-                        options.append(f'-vf yadif=mode=0:parity=-1:deint=1,scale={video_width}:{video_height}')
-                        options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
+                    options.append(f'-vf yadif=mode=0:parity=-1:deint=1,scale={video_width}:{video_height}')
+                    options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
         ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
@@ -663,6 +665,10 @@ class LiveEncodingTask:
         # エンコーダーの種類を取得
         ENCODER_TYPE = CONFIG.general.encoder
 
+        # オリジナル画質 ("original") が指定された場合のみ、mpeg2toh264 での変換・再生を前提に、
+        # tsreadex からの出力をそのままストリーミングする
+        is_original_quality = self.live_stream.quality == 'original'
+
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
         if not (self.live_stream.getStatus().status == 'Standby' and self.live_stream.getStatus().detail == 'エンコードタスクを起動しています…'):
@@ -695,30 +701,55 @@ class LiveEncodingTask:
             ## 有効にすると、特定のストリームのみ PID を固定して出力される
             ## 視聴対象のチャンネルのサービス ID を指定する
             '-n', f'{channel.service_id}' if CONFIG.tv.debug_mode_ts_path is None else '-1',
-            # 主音声ストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-            ## 音声がモノラルであればステレオにする
-            ## デュアルモノを2つのモノラル音声に分離し、右チャンネルを副音声として扱う
-            '-a', '13',
-            # 副音声ストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-            ## 音声がモノラルであればステレオにする
-            '-b', '5',
-            # 字幕ストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、PMT の項目が補われて出力される
-            ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
-            '-c', '5',
-            # 文字スーパーストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、PMT の項目が補われて出力される
-            '-u', '1',
-            # 字幕と文字スーパーを aribb24.js が解釈できる ID3 timed-metadata に変換する
-            ## +4: FFmpeg のバグを打ち消すため、変換後のストリームに規格外の5バイトのデータを追加する
-            ## +8: FFmpeg のエラーを防ぐため、変換後のストリームの PTS が単調増加となるように調整する
-            ## 以前は Linux 版 HWEncC が FFmpeg 4.4 系の共有ライブラリに依存していたため +4 を付与していたが、
-            ## 現在の Linux 版 HWEncC は FFmpeg 8 系を静的リンクした最新版へ更新したため不要になった
-            ## +4 を残すと FFmpeg 6.1 以降では字幕が表示されなくなるため、常に +8 のみを付与する
-            '-d', '9',
         ]
+
+        # オリジナル画質 (mpeg2toh264 で再生) の場合はエンコーダーを通す必要自体がないので、
+        # PMT 上に常に AAC 音声・字幕・文字スーパーが存在する状態にはしつつ、
+        # 音声・字幕・文字スーパーデータ自体は変換せずにそのまま出力する
+        ## mpeg2toh264 は日本の放送波特有のデュアルモノや音声チャンネル切り替えに完全対応している模様 (凄すぎる…)
+        if is_original_quality is True:
+            tsreadex_options += [
+                # 主音声ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、無音の AAC ストリームが出力される
+                '-a', '1',
+                # 副音声ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、無音の AAC ストリームが出力される
+                '-b', '1',
+                # 字幕ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、PMT の項目が補われて出力される
+                ## エンコーダーを通さないため必然的に「5秒ごとに非表示の適当なデータを流す」(+4) 設定 (FFmpeg のバグを打ち消すためのもの) も不要
+                '-c', '1',
+                # 文字スーパーストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、PMT の項目が補われて出力される
+                '-u', '1',
+            ]
+        else:
+            # エンコード済み画質はエンコーダーが安定して入力できる音声と Timed Metadata を生成する
+            tsreadex_options += [
+                # 主音声ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、無音の AAC ストリームが出力される
+                ## +4: 音声がモノラルであればステレオにする
+                ## +8: デュアルモノを2つのモノラル音声に分離し、右チャンネルを副音声として扱う
+                '-a', '13',
+                # 副音声ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、無音の AAC ストリームが出力される
+                ## +4: 音声がモノラルであればステレオにする
+                '-b', '5',
+                # 字幕ストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、PMT の項目が補われて出力される
+                ## +4: 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
+                '-c', '5',
+                # 文字スーパーストリームが常に存在する状態にする
+                ## +1: ストリームが存在しない場合、PMT の項目が補われて出力される
+                '-u', '1',
+                # 字幕と文字スーパーを aribb24.js が解釈できる ID3 timed-metadata に変換する
+                ## +1: 字幕と文字スーパーを ID3 timed-metadata に変換する
+                ## +8: FFmpeg のエラーを防ぐため、変換後のストリームの PTS が単調増加となるように調整する
+                ## 以前は Linux 版 HWEncC が FFmpeg 4.4 系の共有ライブラリに依存していたため +4 を付与していたが、
+                ## 現在の Linux 版 HWEncC は FFmpeg 8 系を静的リンクした最新版へ更新したため不要になった
+                ## +4 を残すと FFmpeg 6.1 以降では字幕が表示されなくなるため、常に +8 のみを付与する
+                '-d', '9',
+            ]
 
         if CONFIG.tv.debug_mode_ts_path is None:
             # 通常は標準入力を指定
@@ -768,18 +799,55 @@ class LiveEncodingTask:
         if channel.is_radiochannel is True:
             ENCODER_TYPE = 'FFmpeg'
 
-        # ソース直通モード: 品質 'source' が選ばれた場合は FFmpeg の -vcodec copy で出力するため、エンコーダーを強制的に FFmpeg にする
-        if self.live_stream.quality == 'source':
-            ENCODER_TYPE = 'FFmpeg'
+        # オリジナル画質 ("original") 指定時のみ、Python で単に左から右にパイプで流すだけの無変換プロセスを「エンコーダー」として起動する
+        ## KonomiTV の既存ロジックはエンコーダーレスで配信することを想定した設計になっておらず、
+        ## エンコーダーに相当するプロセスがないと特別な条件分岐を大量追加する必要が出てくるため、当面この方向で対応する
+        ## 無駄といえば無駄ではあるが、エンコーダーを起動するよりは負荷は飛躍的に抑えられているので妥協・・・
+        if is_original_quality is True:
+            copy_script = (
+                'import os\n'
+                'while True:\n'
+                '    data = os.read(0, 65536)\n'
+                '    if not data:\n'
+                '        break\n'
+                '    offset = 0\n'
+                '    while offset < len(data):\n'
+                '        offset += os.write(1, data[offset:])\n'
+            )
+            logging.info(f'{self.live_stream.log_prefix} Original MPEG-TS stream passthrough is starting.')
+
+            # エンコーダープロセスを非同期で作成・実行
+            try:
+                encoder = await asyncio.subprocess.create_subprocess_exec(
+                    sys.executable,
+                    '-u',
+                    '-c',
+                    copy_script,
+                    stdin = tsreadex_read_pipe,  # tsreadex からの入力
+                    stdout = asyncio.subprocess.PIPE,  # ストリーム出力
+                    stderr = asyncio.subprocess.PIPE,  # ログ出力 (存在しないが互換性のため)
+                )
+            except BaseException:
+                # tsreadex の起動後にエンコーダーの起動に失敗した場合、
+                ## このままでは親プロセスが例外で脱出して tsreadex だけ残留するため、ここで回収する
+                try:
+                    tsreadex.kill()
+                except Exception:
+                    pass
+                raise
+            finally:
+                # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                os.close(tsreadex_read_pipe)
 
         # FFmpeg
-        if ENCODER_TYPE == 'FFmpeg':
+        elif ENCODER_TYPE == 'FFmpeg':
 
             # オプションを取得
             # ラジオチャンネルかどうかでエンコードオプションを切り替え
             if channel.is_radiochannel is True:
                 encoder_options = self.buildFFmpegOptionsForRadio()
             else:
+                assert self.live_stream.quality != 'original'
                 encoder_options = self.buildFFmpegOptions(self.live_stream.quality, channel.type, is_fullhd_channel)
             logging.info(f'{self.live_stream.log_prefix} FFmpeg Commands:\nffmpeg {" ".join(encoder_options)}')
 
@@ -806,6 +874,7 @@ class LiveEncodingTask:
         # HWEncC
         else:
 
+            assert self.live_stream.quality != 'original'
             # オプションを取得（前段 FFmpeg + 後段 HWEncC）
             ffmpeg_preproc_options, encoder_options = self.buildFFmpegToHWEncCOptions(
                 self.live_stream.quality, ENCODER_TYPE, channel.type, is_fullhd_channel,
@@ -1123,9 +1192,12 @@ class LiveEncodingTask:
             ## そうしないと稀にパケロスするらしく、ブラウザ側で突如再生できなくなることがある
             writer_lock = asyncio.Lock()
 
+            # オリジナル画質向け: ライブストリームへ書き込んだ TS データの累積バイト数
+            original_quality_bytes_written: int = 0
+
             async def Writer() -> None:
 
-                nonlocal chunk_buffer, chunk_written_at, writer_lock
+                nonlocal chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
                     try:
@@ -1145,8 +1217,23 @@ class LiveEncodingTask:
                             if len(chunk_buffer) >= 65536:
 
                                 # エンコーダーからの出力をライブストリームの Queue に書き込む
+                                chunk_size = len(chunk_buffer)
                                 self.live_stream.writeStreamData(bytes(chunk_buffer))
-                                # print(f'Writer:    Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+                                # print(f'Writer:    Chunk size: {chunk_size:05} / Time: {time.time()}')
+
+                                # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                                # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                                if is_original_quality is True:
+                                    live_stream_status = self.live_stream.getStatus()
+                                    if live_stream_status.status == 'Standby':
+                                        original_quality_bytes_written += chunk_size
+                                        if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                            if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                                self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                        else:
+                                            self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                            if self._retry_count > 0:
+                                                self._retry_count = 0
 
                                 # チャンクバッファを空にする（重要）
                                 chunk_buffer = bytearray()
@@ -1166,7 +1253,7 @@ class LiveEncodingTask:
             ## ラジオチャンネルは通常のチャンネルと比べてデータ量が圧倒的に少ないため、64KB に達することは稀で SubWriter でのチャンク書き込みがメインになる
             async def SubWriter() -> None:
 
-                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock
+                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
 
@@ -1181,8 +1268,23 @@ class LiveEncodingTask:
                         if (time.monotonic() - chunk_written_at) > 0.025 and (len(chunk_buffer) > 0):
 
                             # エンコーダーからの出力をライブストリームの Queue に書き込む
+                            chunk_size = len(chunk_buffer)
                             self.live_stream.writeStreamData(bytes(chunk_buffer))
                             # print(f'SubWriter: Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+
+                            # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                            # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                            if is_original_quality is True:
+                                live_stream_status = self.live_stream.getStatus()
+                                if live_stream_status.status == 'Standby':
+                                    original_quality_bytes_written += chunk_size
+                                    if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                        if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                            self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                    else:
+                                        self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                        if self._retry_count > 0:
+                                            self._retry_count = 0
 
                             # チャンクバッファを空にする（重要）
                             chunk_buffer = bytearray()
@@ -1386,7 +1488,9 @@ class LiveEncodingTask:
                     await encoder_log.close()
 
             # タスクを非同期で実行
-            background_tasks.add(asyncio.create_task(EncoderObServer()))
+            ## オリジナル画質 ("original") 指定時のみ、エンコーダーログがないためログの監視開始をスキップする
+            if is_original_quality is False:
+                background_tasks.add(asyncio.create_task(EncoderObServer()))
 
             # ***** エンコードタスク全体の制御 *****
 

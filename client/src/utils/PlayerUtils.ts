@@ -8,7 +8,6 @@ import Utils from '@/utils/Utils';
  * ライブ/録画番組ストリーミング API でベース画質として設定できる動画の画質
  */
 type APIBaseVideoQuality = (
-    'source' |
     '1080p-60fps' |
     '1080p-60fps-hevc' |
     '1080p' |
@@ -31,6 +30,7 @@ type APIBaseVideoQuality = (
  * ライブストリーミング API で設定できる動画の画質
  */
 type LiveAPIVideoQuality = (
+    'original' |
     APIBaseVideoQuality |
     `${APIBaseVideoQuality}-10bit` |
     `${APIBaseVideoQuality}-24fps` |
@@ -77,7 +77,7 @@ export class PlayerUtils {
         if (player.quality === null) {
             return '1080p';
         }
-        const regex = /streams\/video\/[0-9]*\/(.*)\/playlist/;
+        const regex = /streams\/video\/[0-9]*\/([^/]+)\/playlist/;
         const match = player.quality.url.match(regex);
         return match ? (match[1] as VideoAPIVideoQuality) : '1080p';
     }

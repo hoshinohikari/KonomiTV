@@ -96,6 +96,8 @@ app.add_middleware(
     # すべての HTTP メソッドと HTTP ヘッダーを許可
     allow_methods = ['*'],
     allow_headers = ['*'],
+    # 録画原画の Range 応答を別オリジンの開発クライアントからも検証できるようにする
+    expose_headers = ['Accept-Ranges', 'Content-Length', 'Content-Range', 'ETag', 'Last-Modified'],
     allow_credentials = True,
 )
 
@@ -234,6 +236,9 @@ async def Startup():
 
     # 全てのチャンネル&品質のライブストリームを初期化する
     for channel in await Channel.filter(is_watchable=True).order_by('channel_number'):
+        # 映像を持つチャンネルだけ、エンコーダーを通さない原画ストリームを用意する
+        if channel.is_radiochannel is False:
+            LiveStream(channel.display_channel_id, 'original')
         for quality in QUALITY:
             LiveStream(channel.display_channel_id, quality)
 

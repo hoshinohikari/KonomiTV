@@ -4,11 +4,11 @@ import concurrent.futures
 import platform
 import sys
 from collections.abc import Callable
-
-import psutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+
+import psutil
 
 from app.constants import JST
 

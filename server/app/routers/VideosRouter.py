@@ -30,6 +30,7 @@ from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.RecordedProgram import RecordedProgram
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.DisconnectAwareFileResponse import DisconnectAwareFileResponse
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
 
@@ -713,8 +714,9 @@ async def VideoDownloadAPI(
     file_path = recorded_program.recorded_video.file_path
     filename = pathlib.Path(file_path).name
 
-    # MPEG-TS ファイルをダウンロードさせる
-    return FileResponse(
+    # 原画のシークでブラウザーが取得を中止した場合は、不要なファイル読み出しも終了する。
+    # Range・ダウンロード時のファイル名は通常の FileResponse と同じ規則で処理する。
+    return DisconnectAwareFileResponse(
         path = file_path,
         filename = filename,
         media_type = 'video/mp2t',

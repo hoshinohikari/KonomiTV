@@ -9,12 +9,11 @@ import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Set
 import Utils from '@/utils';
 
 
-// 選択可能な画質の種類
-// ライブ視聴専用: 'source' は再圧縮せず映像をそのまま配信する実験的オプション
-export type LiveStreamingQuality = 'source' | '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
-export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['source', '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
-export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
-export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+// 選択可能な画質の型と、エンコーダーで生成する画質の列挙
+export type LiveStreamingQuality = 'original' | '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
+export const LIVE_STREAMING_QUALITIES: Exclude<LiveStreamingQuality, 'original'>[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export type VideoStreamingQuality = 'original' | '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
+export const VIDEO_STREAMING_QUALITIES: Exclude<VideoStreamingQuality, 'original'>[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -514,6 +513,21 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             kind: 'Twitter',
             id: settings.selected_twitter_account_id,
         };
+    }
+
+    // 廃止済みの source や未知の画質は、項目ごとの既定値へ戻す。
+    // 起動時・設定インポート時の両方がこの関数を通るため、保存元に関係なく同じ規則を適用できる。
+    const qualitySettingsKeys = [
+        'tv_streaming_quality', 'tv_streaming_quality_cellular',
+        'video_streaming_quality', 'video_streaming_quality_cellular',
+    ] as const;
+    const selectableQualities: readonly string[] = ['original', ...LIVE_STREAMING_QUALITIES];
+    for (const key of qualitySettingsKeys) {
+        const quality = normalized_settings[key];
+        // 型注釈は JSON の値を検証しないため、実際の型と選択肢の両方を確認する。
+        if (typeof quality !== 'string' || selectableQualities.includes(quality) === false) {
+            normalized_settings[key] = ILocalClientSettingsDefault[key];
+        }
     }
 
     return normalized_settings as ILocalClientSettings;
