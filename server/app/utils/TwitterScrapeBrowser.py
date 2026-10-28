@@ -8,13 +8,12 @@ import re
 import sys
 import time
 from datetime import datetime
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, TypedDict, cast
 
 import anyio
 import psutil
 from fastapi import UploadFile
 from pydantic import BaseModel
-from typing_extensions import TypedDict
 from zendriver import Browser, Tab, cdp
 
 from app import logging, schemas
@@ -1703,7 +1702,7 @@ class TwitterScrapeBrowser:
         # requests_cookie_format=False なので cdp.network.Cookie のリストが返される
         # x.com に関連する Cookie をフィルタリング
         twitter_cookies: list[cdp.network.Cookie] = [
-            c for c in all_cookies if isinstance(c, cdp.network.Cookie) and ('x.com' in c.domain)
+            c for c in all_cookies if ('x.com' in c.domain)
         ]
 
         # Netscape フォーマットで文字列を構築

@@ -10,7 +10,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from cryptography.fernet import Fernet
-from passlib.context import CryptContext
+from pwdlib import PasswordHash
+from pwdlib.hashers.bcrypt import BcryptHasher
 from pydantic import BaseModel, PositiveInt
 
 
@@ -416,10 +417,9 @@ BLUESKY_ACCOUNT_SESSION_FERNET_KEY = base64.urlsafe_b64encode(
 BLUESKY_ACCOUNT_SESSION_FERNET = Fernet(BLUESKY_ACCOUNT_SESSION_FERNET_KEY)
 
 # パスワードハッシュ化のための設定
-PASSWORD_CONTEXT = CryptContext(
-    schemes = ['bcrypt'],
-    deprecated = 'auto',
-)
+PASSWORD_HASH = PasswordHash((BcryptHasher(),))
+# bcrypt 5 は 72 バイト超を拒否するため、従来の passlib と同じ位置で切り捨てる
+PASSWORD_MAX_BYTES = 72
 
 # 外部 API に送信するリクエストヘッダー
 ## KonomiTV の User-Agent を指定

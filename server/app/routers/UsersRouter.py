@@ -29,7 +29,8 @@ from app.constants import (
     ACCOUNT_ICON_DIR,
     JST,
     JWT_SECRET_KEY,
-    PASSWORD_CONTEXT,
+    PASSWORD_HASH,
+    PASSWORD_MAX_BYTES,
 )
 from app.models.AccountLink import AccountLink
 from app.models.BlueskyAccount import BlueskyAccount
@@ -250,7 +251,7 @@ async def UserCreateAPI(
     # 新しいユーザーアカウントのモデルを作成・保存
     current_user = await User.create(
         name = user_create_request.username,  # ユーザー名
-        password = PASSWORD_CONTEXT.hash(user_create_request.password),  # ハッシュ化されたパスワード
+        password = PASSWORD_HASH.hash(user_create_request.password.encode('utf-8')[:PASSWORD_MAX_BYTES]),  # ハッシュ化されたパスワード
         is_admin = False if await User.all().count() > 0 else True,  # 他のユーザーアカウントがまだ作成されていないなら、特別に管理者権限を付与
         client_settings = {},  # クライアント側の設定（ひとまず空の辞書を設定）
     )
@@ -295,7 +296,7 @@ async def UserAccessTokenAPI(
         )
 
     # 指定されたパスワードのハッシュが DB にあるものと一致しない
-    if not PASSWORD_CONTEXT.verify(form_data.password, current_user.password):
+    if not PASSWORD_HASH.verify(form_data.password.encode('utf-8')[:PASSWORD_MAX_BYTES], current_user.password):
         logging.warning(f'[UsersRouter][UserAccessTokenAPI] Incorrect password. [username: {form_data.username}]')
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
@@ -501,7 +502,7 @@ async def UserUpdateAPI(
 
     # パスワードを更新（存在する場合）
     if user_update_request.password is not None:
-        current_user.password = PASSWORD_CONTEXT.hash(user_update_request.password)  # ハッシュ化されたパスワード
+        current_user.password = PASSWORD_HASH.hash(user_update_request.password.encode('utf-8')[:PASSWORD_MAX_BYTES])  # ハッシュ化されたパスワード
 
     # レコードを保存する
     await current_user.save()

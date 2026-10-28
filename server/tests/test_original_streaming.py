@@ -163,7 +163,7 @@ class OriginalFileResponseTests(unittest.IsolatedAsyncioTestCase):
 
         messages, _ = await self.collectResponse([(b'range', b'bytes=999999-')])
         self.assertEqual(messages[0]['status'], 416)
-        self.assertEqual(dict(messages[0]['headers'])[b'content-range'], b'*/262144')
+        self.assertEqual(dict(messages[0]['headers'])[b'content-range'], b'bytes */262144')
 
     async def testDisconnectStopsRemainingRangeAndRunsCleanup(self) -> None:
         """

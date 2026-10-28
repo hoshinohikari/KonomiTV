@@ -10,9 +10,8 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Literal, TextIO
 
-from tortoise import timezone
-
 from app.constants import (
+    JST,
     KONOMITV_SERVER_LOG_PATH,
     LOGS_ARCHIVES_DIR,
     SERVER_LOG_ARCHIVE_RETENTION_DAYS,
@@ -212,7 +211,7 @@ def CleanupOldArchiveLogs(retention_days: int | None) -> None:
 
     # JST 基準で削除閾値を算出する
     ## 例: retention_days=30 の場合、30 日より前の日付ファイルのみ削除する
-    today_in_jst = timezone.now().date()
+    today_in_jst = datetime.now(JST).date()
     delete_before_date = today_in_jst - timedelta(days=retention_days)
 
     # 命名規則に一致するアーカイブファイルのみを対象にクリーンアップする
@@ -257,7 +256,7 @@ def SplitServerLogByDate() -> None:
         """
 
         # ロガー初期化前でも既存ログに近い見た目で観測できるよう、JST タイムスタンプ付きで出力する
-        now_in_jst = timezone.now()
+        now_in_jst = datetime.now(JST)
         date_time_str = now_in_jst.strftime('%Y/%m/%d %H:%M:%S')
         timestamp = f'{date_time_str}.{now_in_jst.microsecond // 1000:03d}'
         level_prefix = f'{level.upper()}:'.ljust(10)
@@ -289,7 +288,7 @@ def SplitServerLogByDate() -> None:
         # ======== Phase 2: 高速パス判定 ========
 
         # ログ本文に含まれる日付表記に合わせて、比較用の今日の日付文字列を JST で生成する
-        today_str = timezone.now().date().strftime('%Y/%m/%d')
+        today_str = datetime.now(JST).date().strftime('%Y/%m/%d')
 
         # ログの先頭で最初に見つかる日付行が今日であれば、全行が今日のログとみなして分割をスキップする
         ## 通常の運用ではほとんどの起動がこのパスを通るため、全行パースのコストを回避できる

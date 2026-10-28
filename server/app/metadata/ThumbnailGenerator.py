@@ -59,7 +59,7 @@ class ThumbnailGenerator:
     MIGRATION_BACKUP_DIR_NAME: ClassVar[str] = 'old'
 
     # 顔検出用カスケード分類器のパス
-    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = pathlib.Path(cv2.__file__).parent / 'data' / 'haarcascade_frontalface_default.xml'
+    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'haarcascade_frontalface_default.xml'
     ANIME_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'lbpcascade_animeface.xml'
 
     # 顔検出の設定
@@ -686,7 +686,7 @@ class ThumbnailGenerator:
                         # MPEG-TS では start_time が 0 から始まらないことがあるため、start_time を考慮する必要がある
                         # start_time は pts 単位（90kHz クロックで表現された開始位置）なので、
                         # offset_sec を pts 単位に変換してから start_time を加算する
-                        if video_stream.time_base is None:
+                        if not video_stream.time_base:
                             # time_base が None の場合はコンテナ形式に応じてフォールバックする
                             if self.container_format == 'MPEG-TS':
                                 time_base = 1 / 90000
@@ -711,7 +711,7 @@ class ThumbnailGenerator:
                             if packet_index >= self.FRAME_EXTRACTION_MAX_DEMUX_PACKETS:
                                 break
                             for decoded_frame in packet.decode():
-                                frame = cast(av.VideoFrame, decoded_frame)
+                                frame = decoded_frame
                                 break
                             if frame is not None:
                                 break
@@ -1830,7 +1830,7 @@ class ThumbnailGenerator:
 
         # 各クラスタの占有率を計算
         total_pixels = len(labels)
-        ratios = np.bincount(labels.flatten()) / total_pixels
+        ratios = np.bincount(labels.flatten().astype(np.int64)) / total_pixels
 
         # 主要な色の評価
         ## 1. 最大の占有率が大きすぎる場合は単調な画像とみなしスコアを下げる
