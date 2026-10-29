@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 
 import ariblib.constants
-import httpx
+import httpx2 as httpx
 from tortoise import Tortoise, connections, exceptions, fields, transactions
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
@@ -93,7 +93,8 @@ class Program(TortoiseModel):
                     await loop.run_in_executor(executor, cls.updateFromEDCBForMultiProcess)
 
             # タスクキャンセル時は子プロセスの終了を待たず、イベントループを即座に呼び出し元へ返す
-            ## Python 3.11 の ProcessPoolExecutor は実行中の処理を即時終了できないため、子プロセス自体は完了まで残る可能性がある
+            ## Python 3.13 の ProcessPoolExecutor には実行中のワーカーを終了させる公開 API がないため、
+            ## ShutdownProcessPoolExecutor() でワーカープロセスへ直接終了要求を出し、応答しなければ強制終了する
             except asyncio.CancelledError:
                 should_wait_executor = False
                 await ShutdownProcessPoolExecutor(executor, is_cancelled=True)

@@ -31,6 +31,7 @@ class StreamEncodingOptions:
         quality: QUALITY_TYPES,
         is_hevc_10bit_requested: bool,
         is_24fps_mode_requested: bool,
+        is_live: bool = False,
     ) -> StreamEncodingOptions:
         """
         API で指定されたオプションから、実際に使うストリームオプションを作る
@@ -39,6 +40,7 @@ class StreamEncodingOptions:
             quality (QUALITY_TYPES): ベース画質
             is_hevc_10bit_requested (bool): クライアントが HEVC 10bit を要求しているかどうか
             is_24fps_mode_requested (bool): クライアントが 24fps モードを要求しているかどうか
+            is_live (bool): ライブ視聴の画質であるかどうか
 
         Returns:
             StreamEncodingOptions: 実際のストリーム生成に使うエンコードオプション
@@ -56,7 +58,8 @@ class StreamEncodingOptions:
         ## 1080p-60fps では 60i を 60p 化するユーザー意図が明確なので、24fps モードより 60fps 化を優先する
         is_24fps_mode_enabled = (
             is_24fps_mode_requested is True and
-            QUALITY[quality].is_60fps is False
+            QUALITY[quality].is_60fps is False and
+            not (is_live and quality not in ('1080p', '1080p-hevc'))
         )
 
         return cls(
@@ -88,7 +91,7 @@ class StreamEncodingOptions:
 @dataclass(frozen=True)
 class StreamQualityWithOptions:
     """
-    ストリーミング配信 API の品質指定を、ベース画質と追加エンコードオプションへ分解した結果を表す
+   ストリーミング配信 API の品質指定を、ベース画質と追加エンコードオプションへ分解した結果を表す
 
     Args:
         quality (LIVE_STREAMING_QUALITY_TYPES): ベース画質
@@ -105,12 +108,13 @@ class StreamQualityWithOptions:
     encoding_options: StreamEncodingOptions
 
 
-def SplitQualityAndEncodingOptions(quality: str) -> StreamQualityWithOptions | None:
+def SplitQualityAndEncodingOptions(quality: str, is_live: bool = False) -> StreamQualityWithOptions | None:
     """
     API パスの品質指定 (例: 720p-hevc-10bit-24fps) を、ベース画質 (720p-hevc) と追加オプション (-10bit / -24fps) に分解する
 
     Args:
         quality (str): API パスで指定された品質
+        is_live (bool): ライブ視聴の画質として判定するかどうか
 
     Returns:
         StreamQualityWithOptions | None: 分解結果 (不正な品質指定の場合は None)
@@ -147,6 +151,7 @@ def SplitQualityAndEncodingOptions(quality: str) -> StreamQualityWithOptions | N
         base_quality,
         is_hevc_10bit_requested,
         is_24fps_mode_requested,
+        is_live,
     )
     return StreamQualityWithOptions(
         quality = base_quality,

@@ -132,6 +132,7 @@ export interface IServerSettings {
     video: {
         recorded_folders: string[];
         exclude_scan_paths: string[];
+        recorded_folders_polling_interval: number;
     };
     capture: {
         upload_folders: string[];
@@ -163,6 +164,7 @@ export const IServerSettingsDefault: IServerSettings = {
     video: {
         recorded_folders: [],
         exclude_scan_paths: [],
+        recorded_folders_polling_interval: 5.0,
     },
     capture: {
         upload_folders: [],
@@ -202,13 +204,9 @@ class Settings {
         // API リクエストを実行
         const response = await APIClient.put<IClientSettings>('/settings/client', settings);
 
-        // エラー処理
+        // 設定同期は再生や画面操作を妨げない補助処理なので、通信失敗や更新競合は次回の同期へ委ねる
         if (response.type === 'error') {
-            switch (response.data.detail) {
-                default:
-                    APIClient.showGenericError(response, 'クライアント設定を更新できませんでした。');
-                    break;
-            }
+            console.warn('Failed to update client settings on server. Skip syncing.');
             return false;
         }
 

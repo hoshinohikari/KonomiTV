@@ -57,7 +57,7 @@ async def ValidateQuality(
 
     # 指定されたエンコード済み品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
-    stream_quality = SplitQualityAndEncodingOptions(quality)
+    stream_quality = SplitQualityAndEncodingOptions(quality, is_live=True)
     if stream_quality is None:
         logging.error(f'[LiveStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
         raise HTTPException(
@@ -65,7 +65,10 @@ async def ValidateQuality(
             detail = 'Specified quality was not found',
         )
 
-    return stream_quality
+    return StreamQualityWithOptions(
+        quality = stream_quality.quality,
+        encoding_options = stream_quality.encoding_options,
+    )
 
 
 @router.get(

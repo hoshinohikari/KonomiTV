@@ -43,7 +43,7 @@ def ParseDatetimeStringToJST(value: str) -> datetime:
         datetime: JST aware な datetime
     """
 
-    # Python 3.11 の datetime.fromisoformat() は区切り文字として半角スペースも扱える
+    # Python 3.11 以降の datetime.fromisoformat() は区切り文字として半角スペースも扱える
     return NormalizeToJSTDatetime(datetime.fromisoformat(value))
 
 
@@ -190,7 +190,8 @@ async def ShutdownProcessPoolExecutor(
 
         # Python 3.14 の terminate_workers() / kill_workers() と同じ考え方で、
         ## ProcessPoolExecutor が内部で保持しているワーカープロセスへ直接終了要求を出す
-        ## Python 3.11 には公開 API がないため非公開属性を参照するが、依存箇所はこの関数だけに閉じ込める
+        ## Python 3.13 には公開 API がないため非公開属性を参照するが、依存箇所はこの関数だけに閉じ込める
+        ## Python 3.14 以降へ上げたら、この非公開属性の参照は terminate_workers() / kill_workers() に置き換えられる
         executor_processes = executor._processes  # pyright: ignore[reportPrivateUsage]
         worker_processes = list(executor_processes.values()) if executor_processes is not None else []
 
@@ -252,7 +253,7 @@ def TerminateSubprocessTree(process: asyncio.subprocess.Process | None) -> None:
         if root_process.is_running() is not True:
             return
         # 子から順に kill し、親だけ先に落として子が孤児化する可能性を下げる
-        target_processes = root_process.children(recursive=True)
+        target_processes = list(reversed(root_process.children(recursive=True)))
         target_processes.append(root_process)
     except psutil.NoSuchProcess:
         return
@@ -264,7 +265,7 @@ def TerminateSubprocessTree(process: asyncio.subprocess.Process | None) -> None:
             pass
         return
 
-    for target_process in reversed(target_processes):
+    for target_process in target_processes:
         try:
             target_process.kill()
         except psutil.NoSuchProcess:

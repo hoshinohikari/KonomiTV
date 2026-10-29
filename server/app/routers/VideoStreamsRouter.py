@@ -1,14 +1,19 @@
 
 import asyncio
 import json
-from typing import Annotated
+import struct
+import uuid
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 from app import logging
+from app.constants import QUALITY
 from app.models.RecordedProgram import RecordedProgram
+from app.schemas import OfflineVideoStreamMetadata
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
@@ -22,6 +27,9 @@ router = APIRouter(
     prefix = '/api/streams/video',
 )
 
+# オフライン保存はエンコーダーを長時間占有するため、通常視聴分の余裕を残して同時実行数を制限する
+OFFLINE_VIDEO_STREAM_SEMAPHORE = asyncio.Semaphore(3)
+
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
     """ 録画番組 ID のバリデーション """
@@ -30,7 +38,8 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
     recorded_program = await RecordedProgram.filter(id=video_id).get_or_none() \
         .select_related('recorded_video') \
         .select_related('channel')
-    if recorded_program is None:
+    # 録画ファイルが見つからなくなった (Missing の) 録画番組は再生できないので、存在しない録画番組と同じく扱う
+    if recorded_program is None or recorded_program.recorded_video.status == 'Missing':
         logging.error(f'[VideoStreamsRouter][ValidateVideoID] Specified video_id was not found. [video_id: {video_id}]')
         raise HTTPException(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -53,8 +62,9 @@ async def ValidateQuality(quality: Annotated[str, Path(description='映像の品
             detail = 'Specified quality was not found',
         )
 
-    # 原画録画はファイルの Range 配信で再生するため、HLS のエンコード経路には渡さない
+    # 指定された画質が "original" の場合、HLS プレイリストではオリジナル画質で配信できないのでエラーにする
     if stream_quality.quality == 'original':
+        logging.error(f'[VideoStreamsRouter][ValidateQuality] Original quality is not available for HLS playlist. [quality: {quality}]')
         raise HTTPException(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Original quality is not available for HLS playlist',
@@ -79,6 +89,10 @@ async def VideoHLSPlaylistAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
     cache_key: Annotated[str | None, Query(description='キャッシュ制御用のキー。')] = None,
+    playlist_type: Annotated[
+        Literal['master', 'primary-audio', 'secondary-audio'],
+        Query(alias='type', description='プレイリストの種類。'),
+    ] = 'primary-audio',
 ):
     """
     指定された画質に対応する、録画番組のストリーミング用 HLS M3U8 プレイリストを返す。<br>
@@ -95,10 +109,27 @@ async def VideoHLSPlaylistAPI(
         is_new_session_allowed = True,
     )
 
-    # 仮想 HLS M3U8 プレイリストを取得
-    virtual_playlist = video_stream.getVirtualPlaylist(cache_key)
+    # 映像・主音声と副音声は同じエンコード結果を共有し、プレイリストの種類だけをこの API で切り替える
+    if playlist_type == 'master':
+        # MPEG-TS の多重化オーバーヘッドを10%見込み、最大映像と2本分の音声を収容できる帯域幅を宣言する
+        quality = QUALITY[stream_quality.quality]
+        video_bitrate = int(quality.video_bitrate_max.removesuffix('K')) * 1000
+        audio_bitrate = int(quality.audio_bitrate.removesuffix('K')) * 1000
+        bandwidth = round((video_bitrate + audio_bitrate * 2) * 1.1)
+        playlist_uri = f'playlist?session_id={session_id}'
+
+        # tsreadex は副音声のない区間も無音 AAC で補完するため、番組情報に関係なく常に2本の音声トラックを公開する
+        ## 編成の途中から副音声が始まる場合も、利用者の選択を維持したまま再生できる
+        playlist = '#EXTM3U\n#EXT-X-VERSION:6\n'
+        playlist += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="主音声",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="jpn"\n'
+        playlist += f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="副音声",DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="jpn",URI="{playlist_uri}&type=secondary-audio"\n'
+        playlist += f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AUDIO="audio"\n'
+        playlist += f'{playlist_uri}&type=primary-audio\n'
+    else:
+        audio = 'secondary' if playlist_type == 'secondary-audio' else 'primary'
+        playlist = video_stream.getVirtualPlaylist(cache_key, audio)
     return Response(
-        content = virtual_playlist,
+        content = playlist,
         media_type = 'application/vnd.apple.mpegurl',
         headers = {
             'Cache-Control': 'max-age=0',
@@ -123,6 +154,7 @@ async def VideoHLSSegmentAPI(
     session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
     sequence: Annotated[int, Query(description='HLS セグメントの 0 スタートのシーケンス番号。')],
     cache_key: Annotated[str | None, Query(description='キャッシュ制御用のキー。')],
+    audio: Annotated[Literal['primary', 'secondary'], Query(description='音声トラック。')] = 'primary',
 ):
     """
     指定された画質に対応する、録画番組のストリーミング用 HLS セグメントを返す。<br>
@@ -135,7 +167,21 @@ async def VideoHLSSegmentAPI(
     video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
 
     # セグメントを取得（キャッシュキーはブラウザキャッシュ避けのための ID なので特に使わない）
-    segment_data = await video_stream.getSegment(sequence)
+    try:
+        segment_data = await video_stream.getSegment(sequence, audio)
+    except ValueError as ex:
+        logging.error(f'{video_stream.log_prefix} Failed to get segment. [sequence: {sequence}, audio: {audio}]', exc_info=ex)
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = f'Failed to get segment. [audio: {audio}]',
+        ) from ex
+    # エンコードや入力位置の解決に失敗した場合は、再生クライアントへ原因を区別できるレスポンスを返す
+    except RuntimeError as ex:
+        logging.error(f'{video_stream.log_prefix} Failed to generate segment. [sequence: {sequence}, audio: {audio}]', exc_info=ex)
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f'Failed to generate segment. [audio: {audio}]',
+        ) from ex
     if segment_data is None:
         logging.error(
             f'{video_stream.log_prefix} Specified sequence segment was not found. '
@@ -252,3 +298,124 @@ async def VideoHLSKeepAliveAPI(
 
     # セッションのアクティブ状態を維持する
     video_stream.keepAlive()
+
+
+@router.get(
+    '/{video_id}/{quality}/offline-stream',
+    summary = '録画番組オフライン保存ストリーム API',
+    response_class = StreamingResponse,
+    responses = {
+        status.HTTP_200_OK: {
+            'description': 'オフライン保存用のメタデータと HLS セグメントを格納したバイナリストリーム。',
+            'content': {'application/octet-stream': {}},
+        },
+        status.HTTP_409_CONFLICT: {
+            'description': '録画中のためオフライン保存を開始できない。',
+        },
+    },
+)
+async def VideoOfflineStreamAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    quality: Annotated[str, Path(description='映像の品質。ex: 720p-hevc-10bit-24fps')],
+) -> StreamingResponse:
+    """
+    録画番組を指定画質で先頭から順にエンコードし、オフライン保存用の単一ストリームとして返す。<br>
+    応答は `KTVODLP` のヘッダーから始まる独自バイナリ形式で、長さ付き JSON メタデータ、長さ付き MPEG-TS セグメント、終端レコードの順に格納される。
+    """
+
+    # 追いかけ再生中のファイルは終端とハッシュが変化するため、録画完了後だけ保存を許可する
+    if recorded_program.recorded_video.status == 'Recording':
+        logging.error(f'[VideoOfflineStreamAPI] Recording video cannot be saved for offline playback. [video_id: {recorded_program.id}]')
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'Recording video cannot be saved for offline playback',
+        )
+
+    # 待機中のリクエストは HTTP 応答を開始せず、クライアント側で Waiting と表示できる状態を維持する
+    await OFFLINE_VIDEO_STREAM_SEMAPHORE.acquire()
+    video_stream: VideoStream | None = None
+    try:
+        # 通常再生とは独立したセッションを作り、仮想プレイリスト生成によって全セグメント情報を初期化する
+        session_id = f'offline-{uuid.uuid4().hex}'
+        assert stream_quality.quality != 'original'
+        video_stream = VideoStream(
+            session_id,
+            recorded_program,
+            stream_quality.quality,
+            stream_quality.encoding_options,
+            is_new_session_allowed = True,
+        )
+        video_stream.getVirtualPlaylist()
+
+        # Pydantic を通して、クライアントへ渡す JSON の型とフィールドを固定する
+        metadata = OfflineVideoStreamMetadata(
+            video_id = recorded_program.id,
+            file_hash = recorded_program.recorded_video.file_hash,
+            quality = quality,
+            duration_seconds = recorded_program.recorded_video.duration,
+        ).model_dump_json().encode('utf-8')
+    except Exception:
+        # StreamingResponse を返す前の失敗ではジェネレーターの finally が動かないため、ここで実行枠を返す
+        if video_stream is not None:
+            await video_stream.destroy()
+        OFFLINE_VIDEO_STREAM_SEMAPHORE.release()
+        raise
+
+    is_stream_cleaned_up = False
+
+    async def CleanupOfflineVideoStream() -> None:
+        """オフライン保存用ストリームと同時実行枠を解放する。"""
+        nonlocal is_stream_cleaned_up
+        # 応答本文の finally と StreamingResponse の終了処理から重複して呼ばれるため、最初の1回だけ解放する
+        if is_stream_cleaned_up is True:
+            return
+        is_stream_cleaned_up = True
+        await video_stream.destroy()
+        OFFLINE_VIDEO_STREAM_SEMAPHORE.release()
+
+    async def GenerateOfflineVideoStream():
+        """オフライン保存用のバイナリストリームを生成する。"""
+
+        # 長い1セグメントのエンコード中も10秒のセッションタイムアウトを迎えないよう、視聴画面と同じ周期で維持する
+        async def KeepVideoStreamAlive() -> None:
+            """ダウンロード中の録画視聴セッションを維持する。"""
+            while True:
+                await asyncio.sleep(5)
+                video_stream.keepAlive()
+
+        keep_alive_task = asyncio.create_task(KeepVideoStreamAlive())
+        try:
+            # 固定マジック値とメタデータ長により、任意のネットワーク分割位置から同じ規則で復元できる
+            yield b'KTVODLP\n'
+            yield struct.pack('>I', len(metadata))
+            yield metadata
+
+            # VideoStream が連続生成したセグメントを順番どおり読み、各データを独立して CacheStorage へ格納できる単位にする
+            for segment in video_stream.segments:
+                segment_data = await video_stream.getSegment(segment.sequence_index)
+                if segment_data is None or len(segment_data) == 0:
+                    logging.error(f'[VideoOfflineStreamAPI] Offline segment generation failed. [sequence: {segment.sequence_index}]')
+                    raise RuntimeError(f'Offline segment generation failed. [sequence: {segment.sequence_index}]')
+                duration_milliseconds = max(1, round(segment.duration_seconds * 1000))
+                yield struct.pack('>III', segment.sequence_index, duration_milliseconds, len(segment_data))
+                yield segment_data
+
+            # 終端レコードには件数を格納し、通信切断による末尾欠落をクライアント側で検出できるようにする
+            yield struct.pack('>II', 0xffffffff, len(video_stream.segments))
+        finally:
+            # 応答完了・切断・例外のすべてで維持タスクとエンコーダーを終了し、次の保存へ実行枠を返す
+            keep_alive_task.cancel()
+            await asyncio.gather(keep_alive_task, return_exceptions=True)
+            await CleanupOfflineVideoStream()
+
+    return StreamingResponse(
+        GenerateOfflineVideoStream(),
+        media_type = 'application/octet-stream',
+        headers = {
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+        },
+        # クライアントが応答開始直後に切断し、ジェネレーター本体が一度も実行されない場合も必ず解放する
+        background = BackgroundTask(CleanupOfflineVideoStream),
+    )

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 import aiofiles
 import aiohttp
 import anyio
-import httpx
+import httpx2 as httpx
 from aiofiles.threadpool.text import AsyncTextIOWrapper
 from biim.mpeg2ts import ts
 
@@ -196,7 +196,7 @@ class LiveEncodingTask:
             options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
         else:
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
-            if QUALITY[quality].is_60fps is True:
+            if quality not in ('1080p', '1080p-hevc'):
                 options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
                 options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
             ## インターレース解除 (60i → 30p (フレームレート: 30fps))
@@ -317,6 +317,14 @@ class LiveEncodingTask:
         ## QSVEncC・NVEncC・rkmppenc は HW デコーダーを利用する
         else:
             options.append('--avhw')
+        ## 入力途中の解像度変更に備えて、デコーダー/入力サーフェスの最大確保解像度を指定する
+        ## --output-res は出力側の固定解像度であり、こちらは入力側の上限なので併用する
+        ## BS4K は入力が 4K のため 3840×2160、それ以外のチャンネルは HD 上限の 1920×1080 とする
+        ## (画質プリセットの出力解像度とは独立で、入力に現れうる最大解像度を確保する必要がある)
+        if channel_type == 'BS4K':
+            options.append('--adapt-resolution 3840x2160')
+        else:
+            options.append('--adapt-resolution 1920x1080')
 
         # ストリームのマッピング
         ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
@@ -330,9 +338,12 @@ class LiveEncodingTask:
         max_interleave_delta = round(500 + (self._retry_count * 100))
         options.append('-m avioflags:direct -m fflags:nobuffer+flush_packets -m flush_packets:1 -m max_delay:250000')
         options.append(f'-m max_interleave_delta:{max_interleave_delta}K --output-thread 0 --lowlatency')
-        ## QSVEncC と rkmppenc では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
+        ## QSVEncC と rkmppenc では 24fps モード以外では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
         if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and not self.live_stream.encoding_options.is_24fps_mode_enabled:
             options.append('--disable-opencl')
+        ## QSVEncC かつ OpenCL が使われる経路において、OpenCL タスクを従来通りシングルスレッドで実行することで、CPU 使用率を下げる
+        if encoder_type == 'QSVEncC':
+            options.append('--opencl-task-threads 0')
         ## NVEncC では NVML によるモニタリングと DX11, Vulkan を無効化することで初期化フェーズを高速化する
         if encoder_type == 'NVEncC':
             options.append('--disable-nvml 1 --disable-dx11 --disable-vulkan')
@@ -411,7 +422,7 @@ class LiveEncodingTask:
             ## NVEncC の --vpp-deinterlace bob は品質が悪いので、代わりに --vpp-yadif を使う
             ## NVIDIA GPU は当然ながら Intel の内蔵 GPU よりも性能が高いので、GPU フィルタを使ってもパフォーマンスに問題はないと判断
             ## VCEEncC では --vpp-deinterlace 自体が使えないので、代わりに --vpp-yadif を使う
-            if QUALITY[quality].is_60fps is True:
+            if quality not in ('1080p', '1080p-hevc'):
                 if encoder_type == 'QSVEncC':
                     options.append('--vpp-deinterlace bob')
                 elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
@@ -969,16 +980,11 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    # tsreadex とエンコーダーは別々の try で終了する
-                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
-                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
                     except Exception:
                         pass
                     try:
-                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
-                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -1027,16 +1033,11 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    # tsreadex とエンコーダーは別々の try で終了する
-                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
-                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
                     except Exception:
                         pass
                     try:
-                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
-                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -1070,16 +1071,11 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    # tsreadex とエンコーダーは別々の try で終了する
-                    ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
-                    ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
                     try:
                         tsreadex.kill()
                     except Exception:
                         pass
                     try:
-                        # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
-                        # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
                         TerminateSubprocessTree(encoder)
                     except Exception:
                         pass
@@ -1514,8 +1510,7 @@ class LiveEncodingTask:
                         if program_following is not None:
 
                             # 現在の番組のタイトルをログに出力
-                            ## TODO: 番組の解像度が変わった際にエンコーダーがクラッシュorフリーズする可能性があるが、
-                            ## その場合はここでエンコードタスクを再起動させる必要があるかも
+                            ## 番組の解像度が変わった場合は HWEncC の --adapt-resolution でデコーダー側が追従する想定
                             logging.info(f'{self.live_stream.log_prefix} Title: {program_following.title}')
 
                         program_present = program_following
@@ -1681,16 +1676,11 @@ class LiveEncodingTask:
 
         # 明示的にエンコーダープロセスを終了する
         ## 何らかの理由で既に終了している場合は何もしない
-        # tsreadex とエンコーダーは別々の try で終了する
-        ## tsreadex が先に終了している場合に tsreadex.kill() が例外を投げ、エンコーダーの終了処理が
-        ## スキップされてプロセスがリークするのを防ぐため、それぞれ独立して終了を試みる
         try:
             tsreadex.kill()
         except Exception:
             pass
         try:
-            # エンコーダープロセスだけでなく、その子プロセス (FFmpeg/HWEncC の後続プロセスなど) も
-            # まとめて終了する必要があるため、TerminateSubprocessTree() でプロセスツリーごと終了する
             TerminateSubprocessTree(encoder)
         except Exception:
             pass

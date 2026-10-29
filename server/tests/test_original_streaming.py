@@ -5,10 +5,12 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock
 
+import anyio
 from starlette.background import BackgroundTask
 from starlette.types import Message, Scope
 
 from app.constants import QUALITY
+from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.streams.StreamEncodingOptions import SplitQualityAndEncodingOptions
 from app.utils.DisconnectAwareFileResponse import DisconnectAwareFileResponse
 
@@ -49,9 +51,9 @@ class OriginalQualityTests(unittest.TestCase):
             with self.subTest(quality=quality):
                 self.assertIsNone(SplitQualityAndEncodingOptions(quality))
 
-    def testEncodedQualitiesKeepLocal60fpsSettings(self) -> None:
+    def testLiveAndRecordedQualitiesUseSeparateFrameRates(self) -> None:
         """
-        原画の追加後も既存のエンコード品質と低解像度の 60fps 設定を維持する。
+        ライブの低解像度 60fps を維持しつつ、録画では上流の 24fps オプションを維持する。
 
         Args:
             None
@@ -66,9 +68,36 @@ class OriginalQualityTests(unittest.TestCase):
                 self.assertIsNotNone(parsed)
                 assert parsed is not None
                 self.assertEqual(parsed.quality, name)
-                # 1080p の通常フレームレート版以外は、ローカルで維持している 60fps 品質。
-                if name not in ['1080p', '1080p-hevc']:
-                    self.assertTrue(quality.is_60fps)
+                # ライブと録画で同じ画質を指定しても、24fps の有効条件は独立している。
+                if name not in ['1080p', '1080p-hevc', '1080p-60fps', '1080p-60fps-hevc']:
+                    self.assertFalse(quality.is_60fps)
+                    live = SplitQualityAndEncodingOptions(f'{name}-24fps', is_live=True)
+                    recorded = SplitQualityAndEncodingOptions(f'{name}-24fps')
+                    assert live is not None and recorded is not None
+                    self.assertFalse(live.encoding_options.is_24fps_mode_enabled)
+                    self.assertTrue(recorded.encoding_options.is_24fps_mode_enabled)
+
+
+class ThumbnailRangeTests(unittest.TestCase):
+    """ 新規生成と旧タイル移行の解析範囲を検証する。 """
+
+    def testNewThumbnailsStopAtTenMinutesAndLegacyLayoutUsesFullDuration(self) -> None:
+        """ 新規タイルは 10 分までとし、旧タイルの移行では元の全長レイアウトを再現する。 """
+        generator = ThumbnailGenerator(
+            file_path = anyio.Path('/test/recording.ts'),
+            container_format = 'MPEG-TS',
+            file_hash = 'test',
+            duration_sec = 3600,
+            candidate_time_ranges = [(100, 200), (550, 800), (900, 1200)],
+        )
+        self.assertEqual(generator.analysis_duration, 600)
+        self.assertEqual(generator.candidate_intervals, [(100, 200), (550, 600)])
+        self.assertEqual(generator.total_tiles, 120)
+        self.assertEqual(generator.tile_interval_sec, 5)
+
+        migration = ThumbnailGenerator.forMigration('/test/recording.ts', 'test', 3600)
+        self.assertEqual(migration.analysis_duration, 3600)
+        self.assertGreater(migration.total_tiles * migration.tile_interval_sec, 600)
 
 
 class OriginalFileResponseTests(unittest.IsolatedAsyncioTestCase):

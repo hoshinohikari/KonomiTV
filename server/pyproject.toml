@@ -87,7 +87,10 @@ asyncio_default_test_loop_scope = "session"
 # テスト完了後に一時ディレクトリを即座に削除する
 tmp_path_retention_policy = "none"
 
-# 本ローカル版は KONOMITV_TEST による実データ分離に未対応のため、テストでは一時 DB を明示する。
+# テストの実行時に設定する環境変数
+## KONOMITV_TEST が 1 のとき、書き込みが発生するファイルとフォルダの名前に .test が付き、実際に使っている DB・設定・サムネイル・ログと分かれる
+[tool.pytest_env]
+KONOMITV_TEST = "1"
 
 [tool.ruff]
 # インデントの幅を4スペースに設定

@@ -7,6 +7,8 @@
             <v-spacer></v-spacer>
             <!-- 番組表コントロール用スロット -->
             <slot name="timetable-controls"></slot>
+            <!-- スマホ縦画面では Navigation が非表示のため、ヘッダー側にバッジを残す -->
+            <OfflineDownloadBadge class="mr-4" />
             <div v-if="showSearchButton" v-ripple class="search-button" @click="activateSearch">
                 <Icon icon="fluent:search-20-filled" height="24px" />
             </div>
@@ -29,6 +31,8 @@
 
 import { ref, computed, onMounted, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
+
+import OfflineDownloadBadge from '@/components/OfflineDownloadBadge.vue';
 
 // Props の定義
 const props = withDefaults(defineProps<{
@@ -74,11 +78,14 @@ const searchQuery = computed({
 // 番組表ページでは検索ボタンは表示するが、設定/ログイン/登録/キャプチャページでは非表示
 const showSearchButton = computed(() => {
     const path = route.path;
-    return !path.startsWith('/captures') && !path.startsWith('/settings') && !path.startsWith('/login') && !path.startsWith('/register');
+    return !path.startsWith('/settings') && !path.startsWith('/login') && !path.startsWith('/register');
 });
 
 // 検索プレースホルダー
 const searchPlaceholder = computed(() => {
+    if (route.path.startsWith('/captures')) {
+        return 'キャプチャを検索...';
+    }
     return isVideoSection(route.path)
         ? '録画番組やシリーズを検索...'
         : '放送予定の番組を検索...';
@@ -88,11 +95,15 @@ const searchPlaceholder = computed(() => {
 const isVideoSection = (path: string) => {
     return path.startsWith('/videos') ||
            path.startsWith('/mylist') ||
-           path.startsWith('/watched-history');
+           path.startsWith('/watched-history') ||
+           path.startsWith('/offline-videos');
 };
 
 // 検索パスを取得
 const getSearchPath = () => {
+    if (route.path.startsWith('/captures')) {
+        return '/captures/search';
+    }
     return isVideoSection(route.path)
         ? '/videos/search'
         : '/tv/search';
