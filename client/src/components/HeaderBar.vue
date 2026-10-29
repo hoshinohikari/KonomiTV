@@ -16,6 +16,7 @@
             <Icon icon="material-symbols:install-desktop-rounded" height="20px" class="mr-1" />
             アプリとしてインストール
         </v-btn>
+        <SiteDataResetButton class="ml-2" />
         <div class="mr-3 mr-md-6"></div>
     </header>
 </template>
@@ -24,6 +25,8 @@
 import { pwaInstallHandler } from 'pwa-install-handler';
 import { onMounted, ref, computed, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
+
+import SiteDataResetButton from '@/components/SiteDataResetButton.vue';
 
 const props = defineProps<{
     searchQuery?: string;

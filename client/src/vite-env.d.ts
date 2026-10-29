@@ -303,6 +303,7 @@ declare global {
     }
 
     interface BackgroundFetchManager {
+        getIds(): Promise<string[]>;
         fetch(id: string, requests: RequestInfo[], options: BackgroundFetchOptions): Promise<BackgroundFetchRegistration>;
         get(id: string): Promise<BackgroundFetchRegistration | undefined>;
     }

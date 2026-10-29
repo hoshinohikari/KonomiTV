@@ -21,6 +21,10 @@ export default defineConfig({
     build: {
         chunkSizeWarningLimit: 3 * 1024 * 1024,  // 3MB に緩和
         rollupOptions: {
+            input: {
+                main: fileURLToPath(new URL('./index.html', import.meta.url)),
+                reset: fileURLToPath(new URL('./reset-site-data.html', import.meta.url)),
+            },
             output: {
                 assetFileNames: (assetInfo) => {
                     // フォントファイルのみ、ハッシュを付けずに assets/fonts/ に出力する
@@ -60,6 +64,14 @@ export default defineConfig({
         port: 7011,
         strictPort: true,
         allowedHosts: true,
+        // リセット応答はページと同じオリジンから返す必要があるため、この API だけ中継する。
+        // 通常の API 通信は従来どおり Utils.api_base_url を使う。
+        proxy: {
+            '/api/maintenance/reset-client-data': {
+                target: 'http://127.0.0.77:7010',
+                changeOrigin: false,
+            },
+        },
     },
     preview: {
         host: '0.0.0.0',

@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Coroutine
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import anyio
 import psutil
@@ -49,6 +50,40 @@ background_analysis_task: asyncio.Task[None] | None = None
 capture_scan_task: asyncio.Task[None] | None = None
 # バックグラウンド解析タスクの進捗 (BackgroundAnalysisStatusAPI が参照する)
 background_analysis_status = schemas.MaintenanceTaskStatus()
+
+
+@router.post('/reset-client-data', summary='ブラウザ内データリセット API', status_code=status.HTTP_204_NO_CONTENT)
+def ClientDataResetAPI(request: Request) -> Response:
+    """
+    確認済みの同一オリジンの要求に対して、ブラウザのデータ削除を指示する。
+    サーバー側の設定・アカウント・ファイルは変更しない。
+
+    Args:
+        request (Request): リセットページからの HTTP リクエスト
+
+    Returns:
+        Response: Cookie・キャッシュ・ストレージの削除を指示する空の応答
+    """
+
+    # ログインできない状態でも使えるよう認証は求めず、外部サイトからの要求は拒否する。
+    # HTTPS は Akebi で終端されるため、内部の request.url.scheme ではなく Origin と Host を照合する。
+    try:
+        origin = urlsplit(request.headers.get('origin', ''))
+    except ValueError:
+        # 不正な Origin は外部入力のエラーとして拒否し、削除ヘッダーを返さない。
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Invalid reset origin') from None
+    if (
+        request.headers.get('x-konomitv-reset') != '1' or
+        origin.scheme not in ('https', 'http') or
+        origin.netloc.lower() != request.headers.get('host', '').lower()
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='A same-origin reset request is required')
+
+    # executionContexts は指定せず、現在のページが応答を受け取ってからトップへ移動できるようにする。
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers={
+        'Clear-Site-Data': '"cache", "cookies", "storage"',
+        'Cache-Control': 'no-store',
+    })
 
 
 async def GetCurrentAdminUserOrLocal(
